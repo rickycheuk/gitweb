@@ -289,7 +289,7 @@ async function getLatestCommitFromGitHub(repoUrl: string): Promise<string | null
     githubCommitCache.set(repoUrl, { sha, timestamp: Date.now() });
     
     return sha;
-  } catch (error) {
+  } catch (_error) {
     return null;
   }
 }
@@ -298,7 +298,7 @@ async function getCommitHash(repoPath: string): Promise<string> {
   try {
     const { stdout } = await execAsync('git rev-parse HEAD', { cwd: repoPath });
     return stdout.trim();
-  } catch (error) {
+  } catch (_error) {
     // If local git fails, get from GitHub API
     const match = repoPath.match(/([^\/]+)_([^\/]+)$/);
     if (match) {
@@ -375,6 +375,7 @@ async function cacheResult(
       update: {
         commitHash: combinedHash,
         fileCount,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         analysisResult: analysisResult as any,
         imageUrl,
         previewImageUrl,
@@ -387,6 +388,7 @@ async function cacheResult(
         repo,
         commitHash: combinedHash,
         fileCount,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         analysisResult: analysisResult as any,
         imageUrl,
         previewImageUrl,
@@ -479,11 +481,11 @@ async function removeDirectoryForce(dirPath: string): Promise<void> {
       try {
         // Strategy 1: Node.js fs.rm (fastest)
         await fs.rm(dirPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-      } catch (error) {
+      } catch (_error) {
         // Strategy 2: Shell rm -rf
         try {
           await execAsync(`rm -rf "${dirPath}"`);
-        } catch (rmError) {
+        } catch (_rmError) {
           // Strategy 3: chmod then rm -rf (for permission issues)
           await execAsync(`chmod -R 777 "${dirPath}" 2>/dev/null || true && rm -rf "${dirPath}"`);
         }
@@ -519,41 +521,6 @@ async function removeDirectoryForce(dirPath: string): Promise<void> {
   throw new Error(`Failed to remove directory after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`);
 }
 
-async function isDirectoryCleanForClone(dirPath: string): Promise<boolean> {
-  try {
-    // Check if directory exists
-    await fs.access(dirPath);
-    
-    // Check if it's empty
-    const entries = await fs.readdir(dirPath);
-    if (entries.length === 0) {
-      return true; // Empty directory is clean
-    }
-    
-    // Check if it contains only allowed files/directories
-    const allowedEntries = ['.git', '.gitignore', 'README.md', 'LICENSE'];
-    const hasOnlyAllowed = entries.every(entry => allowedEntries.includes(entry));
-    
-    if (!hasOnlyAllowed) {
-      return false; // Contains unexpected files
-    }
-    
-    // If it has .git, check if it's a valid repo
-    if (entries.includes('.git')) {
-      try {
-        await execAsync('git fsck --no-progress', { cwd: dirPath });
-        return true; // Valid git repo
-      } catch {
-        return false; // Corrupted git repo
-      }
-    }
-    
-    return true; // Only allowed non-git files
-  } catch {
-    return true; // Directory doesn't exist, so it's clean
-  }
-}
-
 async function analyzeCode(repoPath: string, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
   const fileNodes: FileNode[] = [];
   const fileEdges: Edge[] = [];
@@ -561,7 +528,6 @@ async function analyzeCode(repoPath: string, onProgress?: (progress: string) => 
   const fileFunctions = new Map<string, Set<string>>();
   const functionCalls = new Map<string, Set<string>>();
 
-  let fileCount = 0;
   const maxFiles = 100; // Limit to prevent freeze on large repos
 
   // First, collect all file paths

@@ -17,6 +17,8 @@ const eslintConfig = [
       "**/node_modules/**",
       "**/.git/**",
       ".gitweb-cache/**",
+      "**/generated/**",
+      "src/generated/**",
     ],
   },
 ];
