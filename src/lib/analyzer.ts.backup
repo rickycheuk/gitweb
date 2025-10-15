@@ -1,0 +1,396 @@
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+import fs from 'fs/promises';
+import { parseCodeFile, type FunctionInfo } from './parser';
+
+const execAsync = promisify(exec);
+
+const CACHE_DIR = path.join(process.cwd(), '.ncrtn-cache', 'repos');
+
+// Global API call counter
+let apiCallCount = 0;
+
+export function getApiCallCount(): number {
+  return apiCallCount;
+}
+
+export function resetApiCallCount(): void {
+  apiCallCount = 0;
+}
+
+interface FileNode {
+  id: string;
+  label: string;
+  file: string;
+}
+
+interface FunctionNode {
+  id: string;
+  label: string;
+  file: string;
+  type: 'function' | 'class' | 'method';
+}
+
+interface Edge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+interface AnalysisResult {
+  files: {
+    nodes: FileNode[];
+    edges: Edge[];
+  };
+  functions: {
+    nodes: FunctionNode[];
+    edges: Edge[];
+  };
+}
+
+export async function analyzeRepository(repoUrl: string, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
+  // Extract repo name from URL
+  const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+?)(\.git)?$/);
+  if (!match) {
+    throw new Error('Invalid GitHub URL');
+  }
+
+  const [, owner, repo] = match;
+  const repoName = `${owner}_${repo}`;
+  const repoPath = path.join(CACHE_DIR, repoName);
+
+  onProgress?.('Cloning repository...');
+  // Clone or update repository
+  await ensureRepository(repoUrl, repoPath);
+
+  onProgress?.('Analyzing code structure...');
+  // Analyze the repository
+  const result = await analyzeCode(repoPath, onProgress);
+
+  onProgress?.('Finalizing...');
+  return result;
+}
+
+async function ensureRepository(repoUrl: string, repoPath: string): Promise<void> {
+  try {
+    await fs.access(repoPath);
+    // Repository exists, pull latest
+    await execAsync('git pull', { cwd: repoPath });
+  } catch {
+    // Repository doesn't exist, clone it
+    await fs.mkdir(path.dirname(repoPath), { recursive: true });
+    await execAsync(`git clone --depth 1 ${repoUrl} ${repoPath}`);
+  }
+}
+
+async function analyzeCode(repoPath: string, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
+  const fileNodes: FileNode[] = [];
+  const fileEdges: Edge[] = [];
+  const fileImports = new Map<string, Set<string>>();
+  const fileFunctions = new Map<string, Set<string>>();
+  const functionCalls = new Map<string, Set<string>>();
+
+  let fileCount = 0;
+  const maxFiles = 100; // Limit to prevent freeze on large repos
+
+  // First, collect all file paths
+  const allFiles: {filePath: string, relativePath: string}[] = [];
+  await walkDirectory(repoPath, repoPath, async (filePath, relativePath) => {
+    if (!shouldSkipFile(relativePath)) {
+      allFiles.push({filePath, relativePath});
+    }
+  });
+
+  // Limit to maxFiles
+  const filesToProcess = allFiles.slice(0, maxFiles);
+
+  // Process each file
+  for (const file of filesToProcess) {
+    fileCount++;
+    onProgress?.(`Analyzing file ${fileCount}/${filesToProcess.length}: ${file.relativePath}...`);
+
+    try {
+      const content = await fs.readFile(file.filePath, 'utf-8');
+      const analysis = parseCodeFile(content, file.filePath);
+
+      // Add file node
+      const fileId = file.relativePath;
+      fileNodes.push({
+        id: fileId,
+        label: path.basename(file.relativePath),
+        file: file.relativePath,
+      });
+
+      // Store imports
+      if (analysis.imports.length > 0) {
+        fileImports.set(fileId, new Set(analysis.imports));
+      }
+
+      // Store functions and their calls
+      if (analysis.functions.length > 0) {
+        const functions = new Set<string>(analysis.functions.map((f: FunctionInfo) => f.name));
+        fileFunctions.set(fileId, functions);
+        
+        // Store function calls
+        const calls = new Set<string>();
+        analysis.functions.forEach((fn: FunctionInfo) => {
+          fn.calls.forEach((call: string) => calls.add(call));
+        });
+        if (calls.size > 0) {
+          functionCalls.set(fileId, calls);
+        }
+      }
+    } catch (error) {
+      console.error(`Error parsing ${file.relativePath}:`, error);
+    }
+  }
+
+  onProgress?.('Building file relationships...');
+
+  // Create file edges from imports
+  fileImports.forEach((imports, sourceFile) => {
+    imports.forEach((importPath) => {
+      const targetFile = resolveImport(sourceFile, importPath, fileNodes);
+      if (targetFile && targetFile !== sourceFile) {
+        fileEdges.push({
+          id: `${sourceFile}->${targetFile}`,
+          source: sourceFile,
+          target: targetFile,
+        });
+      }
+    });
+  });
+
+  // Create edges based on function calls between files
+  functionCalls.forEach((calls, sourceFile) => {
+    calls.forEach((call) => {
+      // Find which file contains this function
+      fileFunctions.forEach((functions, targetFile) => {
+        if (targetFile !== sourceFile && functions.has(call)) {
+          fileEdges.push({
+            id: `${sourceFile}-calls-${targetFile}::${call}`,
+            source: sourceFile,
+            target: targetFile,
+          });
+        }
+      });
+    });
+  });
+
+  // Add directory-based relationships
+  fileNodes.forEach((node, i) => {
+    fileNodes.slice(i + 1).forEach((otherNode) => {
+      const nodeDir = path.dirname(node.id);
+      const otherDir = path.dirname(otherNode.id);
+      
+      // Files in same directory often relate
+      if (nodeDir === otherDir && nodeDir !== '.' && !hasEdge(fileEdges, node.id, otherNode.id)) {
+        fileEdges.push({
+          id: `${node.id}-samedir-${otherNode.id}`,
+          source: node.id,
+          target: otherNode.id,
+        });
+      }
+    });
+  });
+
+  return {
+    files: { nodes: fileNodes, edges: fileEdges },
+    functions: { nodes: [], edges: [] },
+  };
+}
+
+function hasEdge(edges: Edge[], source: string, target: string): boolean {
+  return edges.some(edge => edge.source === source && edge.target === target);
+}
+
+async function walkDirectory(
+
+    for (const node of result.files.nodes) {
+      const fullPath = path.join(repoPath, node.id);
+      try {
+        const content = await fs.readFile(fullPath, 'utf-8');
+        const parsed = parseCodeFile(content, node.id);
+
+        const digest: LLMFileDigest = {
+          filePath: node.id,
+          size: content.length,
+          preview: content.slice(0, 2000), // Limit preview size
+          imports: parsed.imports.map(imp => ({
+            specifier: imp,
+            resolved: imp,
+            kind: 'es' as const,
+            symbols: [imp]
+          })),
+          exports: parsed.functions.map(func => ({
+            name: func.name,
+            kind: func.type,
+            isExported: true
+          })),
+          calls: parsed.functions.flatMap(func =>
+            func.calls.map(call => ({
+              callerId: node.id,
+              local: call,
+              imported: call,
+            }))
+          )
+        };
+
+        fileDigests.push(digest);
+      } catch (error) {
+        console.warn(`Failed to read file ${node.id}:`, error);
+      }
+    }
+
+    // Use LLM to infer relationships
+    onProgress?.('Analyzing relationships with AI...');
+    const llmResult = await inferRelationshipsWithLLM(fileDigests, {
+      maxFiles: 20, // Limit to prevent excessive API usage
+    });
+
+    if (llmResult) {
+      apiCallCount++;
+      onProgress?.('Processing AI results...');
+      console.log(`OpenAI API call #${apiCallCount} completed`);
+
+      // Add LLM-inferred relationships
+      const enhancedEdges = [...result.files.edges];
+
+      for (const edge of llmResult.fileEdges) {
+        const edgeId = `llm-${edge.source}-${edge.target}`;
+        if (!enhancedEdges.some(e => e.id === edgeId)) {
+          enhancedEdges.push({
+            id: edgeId,
+            source: edge.source,
+            target: edge.target,
+          });
+        }
+      }
+
+      return {
+        ...result,
+        files: {
+          ...result.files,
+          edges: enhancedEdges,
+        },
+      };
+    }
+  } catch (error) {
+    console.warn('LLM enhancement failed, using basic heuristics:', error);
+    onProgress?.('AI analysis failed, using basic analysis...');
+  }
+
+  // Fallback to basic heuristics if LLM fails
+  onProgress?.('Enhancing relationships...');
+  const enhancedEdges = [...result.files.edges];
+
+  // Look for common patterns
+  result.files.nodes.forEach((node, i) => {
+    result.files.nodes.slice(i + 1).forEach((otherNode) => {
+      // Files in same directory often relate
+      const nodeDir = path.dirname(node.id);
+      const otherDir = path.dirname(otherNode.id);
+
+      if (nodeDir === otherDir && nodeDir !== '.') {
+        const edgeId = `${node.id}-samedir-${otherNode.id}`;
+        if (!enhancedEdges.some(e => e.id === edgeId)) {
+          enhancedEdges.push({
+            id: edgeId,
+            source: node.id,
+            target: otherNode.id,
+          });
+        }
+      }
+
+      // Files with similar names might relate
+      const nodeBase = path.basename(node.id, path.extname(node.id));
+      const otherBase = path.basename(otherNode.id, path.extname(otherNode.id));
+
+      if (nodeBase.includes(otherBase) || otherBase.includes(nodeBase)) {
+        if (nodeBase !== otherBase) {
+          const edgeId = `${node.id}-similar-${otherNode.id}`;
+          if (!enhancedEdges.some(e => e.id === edgeId)) {
+            enhancedEdges.push({
+              id: edgeId,
+              source: node.id,
+              target: otherNode.id,
+            });
+          }
+        }
+      }
+    });
+  });
+
+  return {
+    ...result,
+    files: {
+      ...result.files,
+      edges: enhancedEdges,
+    },
+  };
+}
+
+async function walkDirectory(
+  dirPath: string,
+  basePath: string,
+  callback: (filePath: string, relativePath: string) => Promise<void>
+): Promise<void> {
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+    const relativePath = path.relative(basePath, fullPath);
+
+    if (entry.isDirectory()) {
+      if (!shouldSkipDirectory(entry.name)) {
+        await walkDirectory(fullPath, basePath, callback);
+      }
+    } else if (entry.isFile()) {
+      await callback(fullPath, relativePath);
+    }
+  }
+}
+
+function shouldSkipDirectory(name: string): boolean {
+  const skipDirs = [
+    'node_modules', '.git', 'dist', 'build', '.next', 'out',
+    '__pycache__', '.pytest_cache', 'venv', 'env', '.venv',
+    'target', 'bin', 'obj', '.idea', '.vscode', 'coverage',
+  ];
+  return skipDirs.includes(name) || name.startsWith('.');
+}
+
+function shouldSkipFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  const codeExtensions = [
+    '.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.cpp', '.c',
+    '.h', '.hpp', '.cs', '.go', '.rs', '.php', '.rb', '.swift',
+    '.kt', '.scala', '.m', '.mm', '.vue', '.svelte',
+  ];
+  
+  // Skip markdown and other non-code files
+  if (ext === '.md' || ext === '.txt' || ext === '.json' || ext === '.yaml' || ext === '.yml' || ext === '.pdf') {
+    return true;
+  }
+
+  return !codeExtensions.includes(ext);
+}
+
+function resolveImport(
+  sourceFile: string,
+  importPath: string,
+  allFiles: FileNode[]
+): string | null {
+  // Simple resolution - find file that matches the import
+  const normalized = importPath.replace(/^[\.\/]+/, '').replace(/\.(js|ts|jsx|tsx)$/, '');
+  
+  for (const file of allFiles) {
+    const fileNormalized = file.id.replace(/\.(js|ts|jsx|tsx)$/, '');
+    if (fileNormalized.endsWith(normalized)) {
+      return file.id;
+    }
+  }
+
+  return null;
+}
