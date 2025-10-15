@@ -4,6 +4,9 @@ import { prisma } from '@/lib/db';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 
+// Extend timeout for Vercel Pro (60s max) or keep at 10s for free tier
+export const maxDuration = 10; // seconds
+
 interface AnalysisResult {
   summary?: string;
   technologies?: string[];

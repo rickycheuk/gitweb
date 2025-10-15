@@ -20,13 +20,25 @@ async function getCommitHash(repoPath: string): Promise<string> {
 
 export async function POST(request: NextRequest) {
   try {
-    const { repoUrl } = await request.json();
+    const { repoUrl, force } = await request.json();
 
     if (!repoUrl || typeof repoUrl !== 'string') {
       return NextResponse.json(
         { error: 'Repository URL is required' },
         { status: 400 }
       );
+    }
+
+    // Quick check: if preview already exists and force=false, return immediately
+    if (!force) {
+      const cached = await prisma.repositoryCache.findUnique({
+        where: { repoUrl },
+        select: { previewImageUrl: true }
+      });
+
+      if (cached?.previewImageUrl) {
+        return NextResponse.json({ previewImageUrl: cached.previewImageUrl });
+      }
     }
 
     // Check if repo exists in cache, if not create mock data
@@ -101,9 +113,32 @@ export async function POST(request: NextRequest) {
       console.log(`Mock cache entry created for ${repoUrl}`);
     }
 
-    const previewImageUrl = await checkAndGenerateImage(repoUrl, true);
+    // Generate image with 8-second timeout to stay under Vercel's 10s limit
+    const timeoutPromise = new Promise<string | null>((_, reject) =>
+      setTimeout(() => reject(new Error('Image generation timeout')), 8000)
+    );
 
-    return NextResponse.json({ previewImageUrl });
+    const generatePromise = checkAndGenerateImage(repoUrl, true);
+
+    try {
+      const previewImageUrl = await Promise.race([generatePromise, timeoutPromise]);
+      return NextResponse.json({ previewImageUrl });
+    } catch (timeoutError) {
+      // If timeout, check if we have a cached image to return
+      const fallbackCached = await prisma.repositoryCache.findUnique({
+        where: { repoUrl },
+        select: { previewImageUrl: true, imageUrl: true }
+      });
+
+      if (fallbackCached?.previewImageUrl || fallbackCached?.imageUrl) {
+        return NextResponse.json({ 
+          previewImageUrl: fallbackCached.previewImageUrl || fallbackCached.imageUrl,
+          warning: 'Using cached image due to timeout'
+        });
+      }
+
+      throw timeoutError;
+    }
   } catch (error) {
     console.error('Preview image generation error:', error);
     return NextResponse.json(
