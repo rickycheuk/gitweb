@@ -18,15 +18,6 @@ interface ExtendedUser {
   image?: string;
 }
 
-interface ProgressEntry {
-  progress: string;
-  timestamp: number;
-  result?: AnalysisResult;
-  error?: string;
-}
-
-const progressStore = new Map<string, ProgressEntry>();
-
 export async function POST(request: NextRequest) {
   try {
     const { repoUrl } = await request.json();
@@ -98,21 +89,55 @@ export async function POST(request: NextRequest) {
     const sessionId = `analysis_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     resetApiCallCount();
 
-    analyzeRepository(repoUrl, (progress: string) => {
-      progressStore.set(sessionId, { progress, timestamp: Date.now() });
-    }).then((result) => {
+    // Create initial progress entry in database
+    await prisma.analysisProgress.create({
+      data: {
+        sessionId,
+        progress: 'Starting analysis...',
+      },
+    });
+
+    // Start analysis in background
+    analyzeRepository(repoUrl, async (progress: string) => {
+      try {
+        await prisma.analysisProgress.upsert({
+          where: { sessionId },
+          create: {
+            sessionId,
+            progress,
+          },
+          update: {
+            progress,
+          },
+        });
+      } catch (err) {
+        console.warn('Failed to update progress:', err);
+      }
+    }).then(async (result) => {
       const finalApiCallCount = getApiCallCount();
-      progressStore.set(sessionId, {
-        progress: 'completed',
-        timestamp: Date.now(),
-        result: { ...result, apiCallCount: finalApiCallCount }
-      });
-    }).catch((error) => {
-      progressStore.set(sessionId, {
-        progress: 'error',
-        timestamp: Date.now(),
-        error: error.message
-      });
+      try {
+        await prisma.analysisProgress.update({
+          where: { sessionId },
+          data: {
+            progress: 'completed',
+            result: { ...result, apiCallCount: finalApiCallCount } as any, // eslint-disable-line @typescript-eslint/no-explicit-any
+          },
+        });
+      } catch (err) {
+        console.error('Failed to save final result:', err);
+      }
+    }).catch(async (error) => {
+      try {
+        await prisma.analysisProgress.update({
+          where: { sessionId },
+          data: {
+            progress: 'error',
+            error: error.message,
+          },
+        });
+      } catch (err) {
+        console.error('Failed to save error:', err);
+      }
     });
 
     return NextResponse.json({ sessionId });
@@ -133,18 +158,33 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'sessionId required' }, { status: 400 });
   }
 
-  const progressData = progressStore.get(sessionId);
+  try {
+    const progressData = await prisma.analysisProgress.findUnique({
+      where: { sessionId },
+    });
 
-  if (!progressData) {
-    return NextResponse.json({ error: 'Session not found' }, { status: 404 });
-  }
-
-  const oneHourAgo = Date.now() - (60 * 60 * 1000);
-  for (const [key, data] of progressStore.entries()) {
-    if (data.timestamp < oneHourAgo) {
-      progressStore.delete(key);
+    if (!progressData) {
+      return NextResponse.json({ error: 'Session not found' }, { status: 404 });
     }
-  }
 
-  return NextResponse.json(progressData);
+    // Clean up old progress entries (older than 1 hour)
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    await prisma.analysisProgress.deleteMany({
+      where: {
+        updatedAt: {
+          lt: oneHourAgo,
+        },
+      },
+    }).catch((err: unknown) => console.warn('Failed to cleanup old progress:', err));
+
+    return NextResponse.json({
+      progress: progressData.progress,
+      timestamp: progressData.updatedAt.getTime(),
+      result: progressData.result,
+      error: progressData.error,
+    });
+  } catch (error) {
+    console.error('Failed to fetch progress:', error);
+    return NextResponse.json({ error: 'Failed to fetch progress' }, { status: 500 });
+  }
 }
