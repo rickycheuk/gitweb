@@ -367,7 +367,10 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
       headers['Authorization'] = `token ${token}`;
     }
 
-    const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
+    const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { 
+      headers,
+      signal: AbortSignal.timeout(3000) // 3s timeout
+    });
     if (!repoResponse.ok) {
       throw new Error(`Failed to fetch repo info: ${repoResponse.status}`);
     }
@@ -383,7 +386,10 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
     } else {
       const treeResponse = await fetch(
         `https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`,
-        { headers }
+        { 
+          headers,
+          signal: AbortSignal.timeout(5000) // 5s timeout
+        }
       );
       
       if (!treeResponse.ok) {
@@ -419,17 +425,24 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
         Promise.all(
           batch.map(async (file: { path: string; sha: string }) => {
             try {
-              const blobResponse = await fetch(
-                `https://api.github.com/repos/${owner}/${repo}/git/blobs/${file.sha}`,
-                { headers }
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout per file
+              
+              const response = await fetch(
+                `https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${file.path}`,
+                { 
+                  signal: controller.signal,
+                  headers: {
+                    'User-Agent': 'GitWeb-Analyzer'
+                  }
+                }
               );
               
-              if (blobResponse.ok) {
-                const blobData = await blobResponse.json();
-                if (blobData.content && blobData.encoding === 'base64') {
-                  const content = Buffer.from(blobData.content, 'base64').toString('utf-8');
-                  files.set(file.path, content);
-                }
+              clearTimeout(timeoutId);
+              
+              if (response.ok) {
+                const content = await response.text();
+                files.set(file.path, content);
               }
             } catch (_error) {
             }
@@ -501,7 +514,7 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
   const maxFiles = 100;
   const filesToProcess = Array.from(files.entries()).slice(0, maxFiles);
 
-  const batchSize = 30;
+  const batchSize = 50;
   const batches = [];
   for (let i = 0; i < filesToProcess.length; i += batchSize) {
     batches.push(filesToProcess.slice(i, i + batchSize));
