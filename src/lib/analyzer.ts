@@ -3,11 +3,15 @@ import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs/promises';
 import crypto from 'crypto';
+import { createGunzip } from 'node:zlib';
 import { parseCodeFile, type FunctionInfo } from './parser';
 import { inferRelationshipsWithLLM, type LLMFileDigest } from './llm';
 import { prisma } from './db';
 import { generateGraphPreview } from './graphPreview';
 import { deleteImageFromS3 } from './s3';
+import tar from 'tar-stream';
+import type { Headers as TarHeaders } from 'tar-stream';
+import type { PassThrough } from 'node:stream';
 
 const execAsync = promisify(exec);
 
@@ -18,6 +22,9 @@ const GRAPH_VERSION = '2';
 const githubCommitCache = new Map<string, { sha: string; timestamp: number }>();
 const githubTreeCache = new Map<string, { tree: unknown[]; timestamp: number }>();
 const GITHUB_CACHE_TTL = 5 * 60 * 1000;
+const MAX_TARBALL_BYTES = 25 * 1024 * 1024;
+const MAX_FILE_BYTES = 1_200_000;
+const TAR_FETCH_TIMEOUT_MS = 6000;
 
 function cleanupExpiredCache() {
   const now = Date.now();
@@ -125,6 +132,13 @@ interface AnalysisResult {
     edges: Edge[];
   };
 }
+
+type FileParseResult = {
+  success: boolean;
+  fileId: string;
+  fileName: string;
+  analysis: ReturnType<typeof parseCodeFile> | null;
+};
 
 export async function analyzeRepository(repoUrl: string, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
   const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+?)(\.git)?$/);
@@ -354,22 +368,21 @@ async function cacheResult(
 }
 
 async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<string, string>> {
-  const files = new Map<string, string>();
   const maxFiles = 500;
-  
-  try {
-    const token = process.env.GITHUB_TOKEN;
-    const headers: Record<string, string> = {
-      'Accept': 'application/vnd.github.v3+json',
-      'User-Agent': 'GitWeb-Analyzer'
-    };
-    if (token) {
-      headers['Authorization'] = `token ${token}`;
-    }
+  const codeExtensions = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.cpp', '.c', '.go', '.rs', '.rb', '.php', '.cs', '.swift', '.kt'];
+  const token = process.env.GITHUB_TOKEN;
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github.v3+json',
+    'User-Agent': 'GitWeb-Analyzer'
+  };
+  if (token) {
+    headers['Authorization'] = `token ${token}`;
+  }
 
-    const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { 
+  try {
+    const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
       headers,
-      signal: AbortSignal.timeout(3000) // 3s timeout
+      signal: AbortSignal.timeout(3000)
     });
     if (!repoResponse.ok) {
       throw new Error(`Failed to fetch repo info: ${repoResponse.status}`);
@@ -377,84 +390,250 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
     const repoData = await repoResponse.json();
     const defaultBranch = repoData.default_branch || 'main';
 
-    const treeCacheKey = `${owner}/${repo}:${defaultBranch}`;
-    const cachedTree = githubTreeCache.get(treeCacheKey);
-    let tree;
-
-    if (cachedTree && Date.now() - cachedTree.timestamp < GITHUB_CACHE_TTL) {
-      tree = cachedTree.tree;
-    } else {
-      const treeResponse = await fetch(
-        `https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`,
-        { 
-          headers,
-          signal: AbortSignal.timeout(5000) // 5s timeout
-        }
-      );
-      
-      if (!treeResponse.ok) {
-        throw new Error(`Failed to fetch tree: ${treeResponse.status}`);
+    try {
+      const tarballFiles = await fetchFilesViaTarball({ owner, repo, defaultBranch, token, codeExtensions, maxFiles });
+      if (tarballFiles && tarballFiles.size > 0) {
+        return tarballFiles;
       }
-
-      const treeData = await treeResponse.json();
-      tree = treeData.tree || [];
-      
-      githubTreeCache.set(treeCacheKey, { tree, timestamp: Date.now() });
+    } catch (tarballError) {
+      console.warn(`Tarball fetch fallback for ${owner}/${repo}:`, tarballError);
     }
 
-    const codeExtensions = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.cpp', '.c', '.go', '.rs', '.rb', '.php', '.cs', '.swift', '.kt'];
-    const codeFiles = tree
-      .filter((item: { type: string; path: string }) => 
-        item.type === 'blob' && 
-        codeExtensions.some(ext => item.path.endsWith(ext)) &&
-        !item.path.includes('node_modules/') &&
-        !item.path.includes('/.') &&
-        !item.path.includes('test') &&
-        !item.path.includes('spec')
-      )
-      .slice(0, maxFiles);
-
-    const batchSize = 50; 
-    const batches = [];
-    for (let i = 0; i < codeFiles.length; i += batchSize) {
-      batches.push(codeFiles.slice(i, i + batchSize));
-    }
-
-    await Promise.all(
-      batches.map(batch =>
-        Promise.all(
-          batch.map(async (file: { path: string; sha: string }) => {
-            try {
-              const controller = new AbortController();
-              const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout per file
-              
-              const response = await fetch(
-                `https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${file.path}`,
-                { 
-                  signal: controller.signal,
-                  headers: {
-                    'User-Agent': 'GitWeb-Analyzer'
-                  }
-                }
-              );
-              
-              clearTimeout(timeoutId);
-              
-              if (response.ok) {
-                const content = await response.text();
-                files.set(file.path, content);
-              }
-            } catch (_error) {
-            }
-          })
-        )
-      )
-    );
-
-    return files;
+    return await fetchFilesViaTree({ owner, repo, defaultBranch, baseHeaders: headers, token, codeExtensions, maxFiles });
   } catch (error) {
     throw new Error(`Failed to fetch files from GitHub: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function fetchFilesViaTarball(params: {
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  token?: string;
+  codeExtensions: string[];
+  maxFiles: number;
+}): Promise<Map<string, string>> {
+  const { owner, repo, defaultBranch, token, codeExtensions, maxFiles } = params;
+  const headers: Record<string, string> = {
+    'User-Agent': 'GitWeb-Analyzer'
+  };
+  if (token) {
+    headers['Authorization'] = `token ${token}`;
+  }
+
+  const response = await fetch(`https://codeload.github.com/${owner}/${repo}/tar.gz/${defaultBranch}`, {
+    headers,
+    signal: AbortSignal.timeout(TAR_FETCH_TIMEOUT_MS)
+  });
+  if (!response.ok) {
+    throw new Error(`Tarball response status ${response.status}`);
+  }
+
+  const lengthHeader = response.headers.get('content-length');
+  if (lengthHeader) {
+    const tarballSize = Number(lengthHeader);
+    if (!Number.isNaN(tarballSize) && tarballSize > MAX_TARBALL_BYTES) {
+      throw new Error('Tarball larger than limit');
+    }
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.byteLength === 0) {
+    return new Map();
+  }
+  if (buffer.byteLength > MAX_TARBALL_BYTES) {
+    throw new Error('Tarball buffer exceeded limit');
+  }
+
+  const files = new Map<string, string>();
+  const extract = tar.extract();
+  const gunzip = createGunzip();
+  const skippedLargeFiles: string[] = [];
+
+  await new Promise<void>((resolve, reject) => {
+    extract.on('entry', (header: TarHeaders, stream: PassThrough, next: (error?: unknown) => void) => {
+      if (files.size >= maxFiles) {
+        stream.resume();
+        stream.on('end', next);
+        return;
+      }
+
+      if (header.type !== 'file') {
+        stream.resume();
+        stream.on('end', next);
+        return;
+      }
+
+      const parts = header.name.split('/');
+      if (parts.length <= 1) {
+        stream.resume();
+        stream.on('end', next);
+        return;
+      }
+
+      const relativePath = parts.slice(1).join('/');
+      if (!shouldIncludeCodeFile(relativePath, codeExtensions)) {
+        stream.resume();
+        stream.on('end', next);
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let aborted = false;
+
+      stream.on('data', (chunk: Buffer) => {
+        if (aborted) {
+          return;
+        }
+        total += chunk.length;
+        if (total > MAX_FILE_BYTES) {
+          aborted = true;
+          skippedLargeFiles.push(relativePath);
+          stream.resume();
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      stream.on('error', reject);
+      stream.on('end', () => {
+        if (!aborted) {
+          files.set(relativePath, Buffer.concat(chunks).toString('utf-8'));
+        }
+        next();
+      });
+    });
+
+    extract.on('finish', resolve);
+    extract.on('error', reject);
+    gunzip.on('error', reject);
+    gunzip.pipe(extract);
+    gunzip.end(buffer);
+  });
+
+  if (skippedLargeFiles.length > 0 && files.size < maxFiles) {
+    const rawHeaders: Record<string, string> = {
+      'User-Agent': 'GitWeb-Analyzer'
+    };
+    if (token) {
+      rawHeaders['Authorization'] = `token ${token}`;
+    }
+    const remainingCapacity = maxFiles - files.size;
+    const targets = skippedLargeFiles.slice(0, remainingCapacity);
+    await Promise.all(
+      targets.map(async relativePath => {
+        try {
+          const response = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${relativePath}`, {
+            headers: rawHeaders,
+            signal: AbortSignal.timeout(5000)
+          });
+          if (response.ok) {
+            files.set(relativePath, await response.text());
+          }
+        } catch (_error) {
+        }
+      })
+    );
+  }
+
+  return files;
+}
+
+async function fetchFilesViaTree(params: {
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  baseHeaders: Record<string, string>;
+  token?: string;
+  codeExtensions: string[];
+  maxFiles: number;
+}): Promise<Map<string, string>> {
+  const { owner, repo, defaultBranch, baseHeaders, token, codeExtensions, maxFiles } = params;
+  const files = new Map<string, string>();
+  const treeCacheKey = `${owner}/${repo}:${defaultBranch}`;
+  const cachedTree = githubTreeCache.get(treeCacheKey);
+  let tree: unknown[];
+
+  if (cachedTree && Date.now() - cachedTree.timestamp < GITHUB_CACHE_TTL) {
+    tree = cachedTree.tree;
+  } else {
+    const treeResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, {
+      headers: { ...baseHeaders },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!treeResponse.ok) {
+      throw new Error(`Failed to fetch tree: ${treeResponse.status}`);
+    }
+    const treeData = await treeResponse.json();
+    tree = treeData.tree || [];
+    githubTreeCache.set(treeCacheKey, { tree, timestamp: Date.now() });
+  }
+
+  const codeFiles = (tree as Array<{ type: string; path: string }> )
+    .filter(item => item.type === 'blob' && shouldIncludeCodeFile(item.path, codeExtensions))
+    .slice(0, maxFiles);
+
+  if (codeFiles.length === 0) {
+    return files;
+  }
+
+  const rawHeaders: Record<string, string> = {
+    'User-Agent': 'GitWeb-Analyzer'
+  };
+  if (token) {
+    rawHeaders['Authorization'] = `token ${token}`;
+  }
+
+  const batchSize = 50;
+  const batches = [];
+  for (let i = 0; i < codeFiles.length; i += batchSize) {
+    batches.push(codeFiles.slice(i, i + batchSize));
+  }
+
+  await Promise.all(
+    batches.map(batch =>
+      Promise.all(
+        batch.map(async file => {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000);
+          try {
+            const response = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${file.path}`, {
+              signal: controller.signal,
+              headers: rawHeaders
+            });
+            if (response.ok) {
+              const content = await response.text();
+              files.set(file.path, content);
+            }
+          } catch (_error) {
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        })
+      )
+    )
+  );
+
+  return files;
+}
+
+function shouldIncludeCodeFile(filePath: string, codeExtensions: string[]): boolean {
+  if (!codeExtensions.some(ext => filePath.endsWith(ext))) {
+    return false;
+  }
+  if (filePath.includes('node_modules/')) {
+    return false;
+  }
+  if (filePath.includes('/.')) {
+    return false;
+  }
+  const lower = filePath.toLowerCase();
+  if (lower.includes('test') || lower.includes('spec')) {
+    return false;
+  }
+  return true;
 }
 
 async function ensureRepository(_repoUrl: string, _repoPath: string): Promise<void> {
@@ -513,67 +692,77 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
 
   const maxFiles = 100;
   const filesToProcess = Array.from(files.entries()).slice(0, maxFiles);
-
-  const batchSize = 50;
-  const batches = [];
-  for (let i = 0; i < filesToProcess.length; i += batchSize) {
-    batches.push(filesToProcess.slice(i, i + batchSize));
+  if (filesToProcess.length === 0) {
+    return {
+      files: { nodes: [], edges: [] },
+      functions: { nodes: [], edges: [] },
+    };
   }
 
+  const results: FileParseResult[] = new Array(filesToProcess.length);
+  const concurrency = Math.min(50, filesToProcess.length);
+  let index = 0;
   let processedCount = 0;
-  
-  const allBatchResults = await Promise.all(
-    batches.map(batch =>
-      Promise.all(
-        batch.map(async ([relativePath, content]) => {
-          try {
-            const analysis = parseCodeFile(content, relativePath);
 
-            return {
-              fileId: relativePath,
-              fileName: path.basename(relativePath),
-              analysis,
-              success: true,
-            };
-          } catch (_error) {
-            return { fileId: relativePath, fileName: '', analysis: null, success: false };
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      for (;;) {
+        const currentIndex = index++;
+        if (currentIndex >= filesToProcess.length) {
+          break;
+        }
+
+        const [relativePath, content] = filesToProcess[currentIndex];
+        try {
+          const analysis = parseCodeFile(content, relativePath);
+          results[currentIndex] = {
+            success: true,
+            fileId: relativePath,
+            fileName: path.basename(relativePath),
+            analysis,
+          };
+        } catch (_error) {
+          results[currentIndex] = {
+            success: false,
+            fileId: relativePath,
+            fileName: path.basename(relativePath),
+            analysis: null,
+          };
+        } finally {
+          processedCount += 1;
+          if (processedCount % 10 === 0 || processedCount === filesToProcess.length) {
+            onProgress?.(`Analyzing file ${processedCount}/${filesToProcess.length}...`);
           }
-        })
-      )
-    )
+        }
+      }
+    })
   );
 
-  for (const batchResults of allBatchResults) {
-    for (const result of batchResults) {
-      processedCount++;
-      
-      if (processedCount % 10 === 0 || processedCount === filesToProcess.length) {
-        onProgress?.(`Analyzing file ${processedCount}/${filesToProcess.length}...`);
-      }
+  for (const result of results) {
+    if (!result || !result.success || !result.analysis) {
+      continue;
+    }
 
-      if (!result.success || !result.analysis) continue;
+    fileNodes.push({
+      id: result.fileId,
+      label: result.fileName,
+      file: result.fileId,
+    });
 
-      fileNodes.push({
-        id: result.fileId,
-        label: result.fileName,
-        file: result.fileId,
+    if (result.analysis.imports.length > 0) {
+      fileImports.set(result.fileId, new Set(result.analysis.imports));
+    }
+
+    if (result.analysis.functions.length > 0) {
+      const functions = new Set<string>(result.analysis.functions.map((f: FunctionInfo) => f.name));
+      fileFunctions.set(result.fileId, functions);
+
+      const calls = new Set<string>();
+      result.analysis.functions.forEach((fn: FunctionInfo) => {
+        fn.calls.forEach((call: string) => calls.add(call));
       });
-
-      if (result.analysis.imports.length > 0) {
-        fileImports.set(result.fileId, new Set(result.analysis.imports));
-      }
-
-      if (result.analysis.functions.length > 0) {
-        const functions = new Set<string>(result.analysis.functions.map((f: FunctionInfo) => f.name));
-        fileFunctions.set(result.fileId, functions);
-        
-        const calls = new Set<string>();
-        result.analysis.functions.forEach((fn: FunctionInfo) => {
-          fn.calls.forEach((call: string) => calls.add(call));
-        });
-        if (calls.size > 0) {
-          functionCalls.set(result.fileId, calls);
-        }
+      if (calls.size > 0) {
+        functionCalls.set(result.fileId, calls);
       }
     }
   }
