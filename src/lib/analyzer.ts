@@ -561,7 +561,7 @@ async function fetchFilesViaTree(params: {
   } else {
     const treeResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, {
       headers: { ...baseHeaders },
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(5000) 
     });
     if (!treeResponse.ok) {
       throw new Error(`Failed to fetch tree: ${treeResponse.status}`);
