@@ -354,9 +354,12 @@ export async function generateGraphPreview(analysisResult: AnalysisResult, repoU
       throw error;
     }
 
-    // Generate unique key
-    const repoName = repoUrl.replace('https://github.com/', '').replace('/', '_');
-    const key = `previews/${repoName}_${Date.now()}${isPreview ? '_preview' : ''}.png`;
+  // Generate unique key with consistent filename
+  const repoName = repoUrl.replace('https://github.com/', '').replace('/', '_');
+  const sanitizedRepoName = repoName.replace(/[^a-z0-9_-]/gi, '_');
+  const timestampSegment = Date.now().toString();
+  const baseFileName = `gitweb-${sanitizedRepoName}${isPreview ? '-preview' : ''}.png`;
+  const key = `previews/${sanitizedRepoName}/${timestampSegment}/${baseFileName}`;
 
     // Upload to S3
     const imageUrl = await uploadImageToS3(buffer, key);
