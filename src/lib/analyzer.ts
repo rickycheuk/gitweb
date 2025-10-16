@@ -13,14 +13,12 @@ const execAsync = promisify(exec);
 
 const CACHE_DIR = path.join(process.cwd(), '.gitweb-cache', 'repos');
 
-// Increment this version whenever visualization logic changes
 const GRAPH_VERSION = '2';
 
-// In-memory cache for GitHub commits with TTL
 const githubCommitCache = new Map<string, { sha: string; timestamp: number }>();
-const GITHUB_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const githubTreeCache = new Map<string, { tree: unknown[]; timestamp: number }>();
+const GITHUB_CACHE_TTL = 5 * 60 * 1000;
 
-// Function to clean up expired cache entries
 function cleanupExpiredCache() {
   const now = Date.now();
   for (const [key, value] of githubCommitCache.entries()) {
@@ -28,12 +26,15 @@ function cleanupExpiredCache() {
       githubCommitCache.delete(key);
     }
   }
+  for (const [key, value] of githubTreeCache.entries()) {
+    if (now - value.timestamp > GITHUB_CACHE_TTL) {
+      githubTreeCache.delete(key);
+    }
+  }
 }
 
-// Clean up cache every 10 minutes
 setInterval(cleanupExpiredCache, 10 * 60 * 1000);
 
-// Global API call counter
 let apiCallCount = 0;
 
 export function getApiCallCount(): number {
@@ -49,10 +50,8 @@ async function cleanupOldS3Images(imageUrl: string | null, previewImageUrl: stri
   
   for (const url of urlsToDelete) {
     try {
-      // Extract S3 key from signed URL
       const urlObj = new URL(url);
-      const key = urlObj.pathname.substring(1).split('?')[0]; // Remove query parameters
-      
+      const key = urlObj.pathname.substring(1).split('?')[0];
       if (key) {
         await deleteImageFromS3(key);
       }
@@ -69,33 +68,28 @@ async function cleanupLocalGitRepo(repoPath: string): Promise<void> {
     try {
       const dirExists = await fs.access(repoPath).then(() => true).catch(() => false);
       if (!dirExists) {
-        return; // Already clean
+        return;
       }
 
       await removeDirectoryForce(repoPath);
       
-      // Double-check it's actually gone
       const stillExists = await fs.access(repoPath).then(() => true).catch(() => false);
       if (!stillExists) {
-        return; // Success
+        return;
       }
 
-      // If still exists, retry
       if (attempt < maxRetries - 1) {
         console.warn(`Local git repo still exists after cleanup attempt ${attempt + 1}, retrying...`);
         await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
       }
     } catch (error) {
       if (attempt === maxRetries - 1) {
-        // Last attempt failed, throw error
         throw new Error(`Failed to cleanup local git repo after ${maxRetries} attempts: ${error instanceof Error ? error.message : String(error)}`);
       }
-      // Wait before retry
       await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
     }
   }
 
-  // Final verification
   const finalCheck = await fs.access(repoPath).then(() => true).catch(() => false);
   if (finalCheck) {
     throw new Error(`Failed to cleanup local git repo: directory still exists after all attempts`);
@@ -133,7 +127,6 @@ interface AnalysisResult {
 }
 
 export async function analyzeRepository(repoUrl: string, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
-  // Extract repo name from URL
   const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+?)(\.git)?$/);
   if (!match) {
     throw new Error('Invalid GitHub URL');
@@ -142,7 +135,6 @@ export async function analyzeRepository(repoUrl: string, onProgress?: (progress:
   const [, owner, repo] = match;
   const repoName = `${owner}_${repo}`;
 
-  // Record search analytics
   await prisma.repoSearch.create({
     data: {
       repoUrl,
@@ -152,35 +144,26 @@ export async function analyzeRepository(repoUrl: string, onProgress?: (progress:
     },
   }).catch(err => console.warn('Failed to record search analytics:', err));
 
-  onProgress?.('Checking cache...');
-
-  // Check cache first (no need for repoPath anymore)
   const cachedResult = await checkCache(repoUrl, '');
   if (cachedResult) {
     onProgress?.('Loaded from cache');
     return cachedResult;
   }
 
-  onProgress?.('Fetching files from GitHub...');
-  // Fetch files directly from GitHub API (serverless-compatible, no git clone)
   const files = await fetchFilesFromGitHub(owner, repo);
   
   if (files.size === 0) {
     throw new Error('No code files found in repository');
   }
 
-  // Get current commit hash from GitHub API
   const commitHash = await getLatestCommitFromGitHub(repoUrl) || 'unknown';
 
   onProgress?.('Analyzing code structure...');
-  // Analyze the repository from the fetched files
   const result = await analyzeCodeFromFiles(files, onProgress);
 
   onProgress?.('Building relationships...');
-  // Enhance relationships with LLM analysis
   const enhancedResult = await enhanceWithLLMFromFiles(result, files, onProgress);
 
-  // Cache the result
   await cacheResult(repoUrl, repoName, owner, repo, commitHash, result.files.nodes.length, enhancedResult);
 
   onProgress?.('Finalizing...');
@@ -189,58 +172,52 @@ export async function analyzeRepository(repoUrl: string, onProgress?: (progress:
 
 async function checkCache(repoUrl: string, _repoPath: string): Promise<AnalysisResult | null> {
   try {
-    // Check database cache first (fast)
     const cached = await prisma.repositoryCache.findUnique({
       where: { repoUrl },
     });
 
     if (!cached || !cached.commitHash) {
-      return null; // No cache, need to analyze
+      return null;
     }
 
-    // Check if it's been more than 1 day since last update - if so, force full refresh
-    const ONE_DAY_MS = 24 * 60 * 60 * 1000; // 1 day in milliseconds
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    const FIVE_MINUTES_MS = 5 * 60 * 1000;
     const timeSinceLastUpdate = Date.now() - cached.updatedAt.getTime();
     const needsFullRefresh = timeSinceLastUpdate > ONE_DAY_MS;
 
     if (needsFullRefresh) {
-      // Force full refresh: clean up old S3 images (no local git repo in serverless)
       await cleanupOldS3Images(cached.imageUrl, cached.previewImageUrl);
       return null;
     }
 
-    // Extract the git SHA from the combined hash (format: "gitSHA:contentHash")
+    if (timeSinceLastUpdate < FIVE_MINUTES_MS) {
+      return cached.analysisResult as unknown as AnalysisResult;
+    }
+
     const storedGitSha = cached.commitHash.includes(':') 
       ? cached.commitHash.split(':')[0] 
       : cached.commitHash;
 
-    // Get latest commit from GitHub (with caching)
     const latestCommit = await getLatestCommitFromGitHub(repoUrl);
     if (!latestCommit) {
-      // Can't verify - but don't force refresh if cache is recent
-      if (timeSinceLastUpdate < 6 * 60 * 60 * 1000) { // Less than 6 hours old
-        // Silently use cache - this is normal when GitHub API is rate limited or down
+      if (timeSinceLastUpdate < 6 * 60 * 60 * 1000) {
         return cached.analysisResult as unknown as AnalysisResult;
       }
-      return null; // Can't check and cache is old, force refresh
+      return null;
     }
 
-    // If git commit hasn't changed, return cached result
     if (storedGitSha === latestCommit) {
       return cached.analysisResult as unknown as AnalysisResult;
     }
 
-    // Git commit has changed, need to re-analyze: clean up old S3 images (no local git in serverless)
     await cleanupOldS3Images(cached.imageUrl, cached.previewImageUrl);
     return null;
   } catch (_error) {
-    // Cache miss - silently continue
     return null;
   }
 }
 
 async function getLatestCommitFromGitHub(repoUrl: string): Promise<string | null> {
-  // Check in-memory cache first
   const cached = githubCommitCache.get(repoUrl);
   if (cached && (Date.now() - cached.timestamp) < GITHUB_CACHE_TTL) {
     return cached.sha;
@@ -253,7 +230,6 @@ async function getLatestCommitFromGitHub(repoUrl: string): Promise<string | null
     const [, owner, repo] = match;
     const apiUrl = `https://api.github.com/repos/${owner}/${repo}/commits/HEAD`;
     
-    // Add GitHub token if available (increases rate limit from 60/hr to 5000/hr)
     const headers: Record<string, string> = {
       'Accept': 'application/vnd.github.v3+json',
       'User-Agent': 'gitweb-analyzer'
@@ -270,7 +246,6 @@ async function getLatestCommitFromGitHub(repoUrl: string): Promise<string | null
     const data = await response.json();
     const sha = data.sha;
     
-    // Cache the result
     githubCommitCache.set(repoUrl, { sha, timestamp: Date.now() });
     
     return sha;
@@ -284,7 +259,6 @@ async function getCommitHash(repoPath: string): Promise<string> {
     const { stdout } = await execAsync('git rev-parse HEAD', { cwd: repoPath });
     return stdout.trim();
   } catch (_error) {
-    // If local git fails, get from GitHub API
     const match = repoPath.match(/([^\/]+)_([^\/]+)$/);
     if (match) {
       const [, owner, repo] = match;
@@ -305,7 +279,6 @@ async function cacheResult(
   analysisResult: AnalysisResult
 ): Promise<void> {
   try {
-    // Create content hash from analysis result + version
     const contentString = JSON.stringify({
       version: GRAPH_VERSION,
       nodeCount: analysisResult.files.nodes.length + analysisResult.functions.nodes.length,
@@ -318,13 +291,11 @@ async function cacheResult(
     const contentHash = crypto.createHash('sha256').update(contentString).digest('hex').substring(0, 16);
     const combinedHash = commitHash ? `${commitHash}:${contentHash}` : contentHash;
 
-    // Check if images already exist and are up to date
     const cached = await prisma.repositoryCache.findUnique({
       where: { repoUrl },
       select: { imageUrl: true, previewImageUrl: true, commitHash: true }
     });
 
-    // Extract stored content hash
     const storedContentHash = cached?.commitHash?.includes(':') 
       ? cached.commitHash.split(':')[1] 
       : null;
@@ -336,14 +307,12 @@ async function cacheResult(
     let imageUrl: string | null = null;
     let previewImageUrl: string | null = null;
 
-    // Generate full image only if it doesn't exist or content changed
     if (!hasValidFullImage) {
       imageUrl = await generateGraphPreview(analysisResult, repoUrl, false);
     } else {
       imageUrl = cached!.imageUrl;
     }
 
-    // Generate preview image only if it doesn't exist or content changed
     if (!hasValidPreviewImage) {
       previewImageUrl = await generateGraphPreview(analysisResult, repoUrl, true);
     } else {
@@ -384,13 +353,11 @@ async function cacheResult(
   }
 }
 
-// Fetch repository files from GitHub API (serverless-compatible, no git clone)
 async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
-  const maxFiles = 500; // Limit to prevent excessive API calls
+  const maxFiles = 500;
   
   try {
-    // Get repository tree (all files)
     const token = process.env.GITHUB_TOKEN;
     const headers: Record<string, string> = {
       'Accept': 'application/vnd.github.v3+json',
@@ -400,7 +367,6 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
       headers['Authorization'] = `token ${token}`;
     }
 
-    // Get default branch first
     const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
     if (!repoResponse.ok) {
       throw new Error(`Failed to fetch repo info: ${repoResponse.status}`);
@@ -408,20 +374,28 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
     const repoData = await repoResponse.json();
     const defaultBranch = repoData.default_branch || 'main';
 
-    // Get tree recursively
-    const treeResponse = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`,
-      { headers }
-    );
-    
-    if (!treeResponse.ok) {
-      throw new Error(`Failed to fetch tree: ${treeResponse.status}`);
+    const treeCacheKey = `${owner}/${repo}:${defaultBranch}`;
+    const cachedTree = githubTreeCache.get(treeCacheKey);
+    let tree;
+
+    if (cachedTree && Date.now() - cachedTree.timestamp < GITHUB_CACHE_TTL) {
+      tree = cachedTree.tree;
+    } else {
+      const treeResponse = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`,
+        { headers }
+      );
+      
+      if (!treeResponse.ok) {
+        throw new Error(`Failed to fetch tree: ${treeResponse.status}`);
+      }
+
+      const treeData = await treeResponse.json();
+      tree = treeData.tree || [];
+      
+      githubTreeCache.set(treeCacheKey, { tree, timestamp: Date.now() });
     }
 
-    const treeData = await treeResponse.json();
-    const tree = treeData.tree || [];
-
-    // Filter to code files only
     const codeExtensions = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.cpp', '.c', '.go', '.rs', '.rb', '.php', '.cs', '.swift', '.kt'];
     const codeFiles = tree
       .filter((item: { type: string; path: string }) => 
@@ -434,32 +408,35 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
       )
       .slice(0, maxFiles);
 
-    // Fetch file contents in parallel (batches of 10)
-    const batchSize = 10;
+    const batchSize = 50; 
+    const batches = [];
     for (let i = 0; i < codeFiles.length; i += batchSize) {
-      const batch = codeFiles.slice(i, i + batchSize);
-      await Promise.all(
-        batch.map(async (file: { path: string; sha: string }) => {
-          try {
-            const contentResponse = await fetch(
-              `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`,
-              { headers }
-            );
-            
-            if (contentResponse.ok) {
-              const contentData = await contentResponse.json();
-              if (contentData.content) {
-                // GitHub returns base64-encoded content
-                const content = Buffer.from(contentData.content, 'base64').toString('utf-8');
-                files.set(file.path, content);
-              }
-            }
-          } catch (_error) {
-            // Skip files that fail to fetch
-          }
-        })
-      );
+      batches.push(codeFiles.slice(i, i + batchSize));
     }
+
+    await Promise.all(
+      batches.map(batch =>
+        Promise.all(
+          batch.map(async (file: { path: string; sha: string }) => {
+            try {
+              const blobResponse = await fetch(
+                `https://api.github.com/repos/${owner}/${repo}/git/blobs/${file.sha}`,
+                { headers }
+              );
+              
+              if (blobResponse.ok) {
+                const blobData = await blobResponse.json();
+                if (blobData.content && blobData.encoding === 'base64') {
+                  const content = Buffer.from(blobData.content, 'base64').toString('utf-8');
+                  files.set(file.path, content);
+                }
+              }
+            } catch (_error) {
+            }
+          })
+        )
+      )
+    );
 
     return files;
   } catch (error) {
@@ -467,10 +444,7 @@ async function fetchFilesFromGitHub(owner: string, repo: string): Promise<Map<st
   }
 }
 
-// Legacy function - now unused, kept for backward compatibility
 async function ensureRepository(_repoUrl: string, _repoPath: string): Promise<void> {
-  // This function is no longer used - we fetch files directly from GitHub API
-  // Kept for backward compatibility only
   return;
 }
 
@@ -480,57 +454,43 @@ async function removeDirectoryForce(dirPath: string): Promise<void> {
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      // Check if directory exists
       const dirExists = await fs.access(dirPath).then(() => true).catch(() => false);
       if (!dirExists) {
-        return; // Directory already gone, success
+        return;
       }
 
-      // Try multiple removal strategies in sequence
       try {
-        // Strategy 1: Node.js fs.rm (fastest)
         await fs.rm(dirPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       } catch (_error) {
-        // Strategy 2: Shell rm -rf
         try {
           await execAsync(`rm -rf "${dirPath}"`);
         } catch (_rmError) {
-          // Strategy 3: chmod then rm -rf (for permission issues)
           await execAsync(`chmod -R 777 "${dirPath}" 2>/dev/null || true && rm -rf "${dirPath}"`);
         }
       }
 
-      // Wait a bit for filesystem to catch up
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      // Verify directory is actually gone
       const stillExists = await fs.access(dirPath).then(() => true).catch(() => false);
       if (!stillExists) {
-        return; // Successfully removed
+        return;
       }
 
-      // Directory still exists, prepare for retry
-      lastError = new Error(`Directory still exists after removal attempt ${attempt + 1}`);
-      
-      // Wait longer before retry
       if (attempt < maxRetries - 1) {
+        lastError = new Error(`Directory still exists after removal attempt ${attempt + 1}`);
         await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1)));
       }
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      
-      // Wait before retry
       if (attempt < maxRetries - 1) {
         await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1)));
       }
     }
   }
 
-  // If we get here, all retries failed
   throw new Error(`Failed to remove directory after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`);
 }
 
-// Analyze code from GitHub API-fetched files (serverless-compatible)
 async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
   const fileNodes: FileNode[] = [];
   const fileEdges: Edge[] = [];
@@ -538,64 +498,62 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
   const fileFunctions = new Map<string, Set<string>>();
   const functionCalls = new Map<string, Set<string>>();
 
-  const maxFiles = 100; // Limit to prevent freeze on large repos
+  const maxFiles = 100;
   const filesToProcess = Array.from(files.entries()).slice(0, maxFiles);
 
-  // Process files in parallel batches for better performance
-  const batchSize = 10;
+  const batchSize = 30;
   const batches = [];
   for (let i = 0; i < filesToProcess.length; i += batchSize) {
     batches.push(filesToProcess.slice(i, i + batchSize));
   }
 
   let processedCount = 0;
-  for (const batch of batches) {
-    const batchResults = await Promise.all(
-      batch.map(async ([relativePath, content]) => {
-        try {
-          const analysis = parseCodeFile(content, relativePath);
+  
+  const allBatchResults = await Promise.all(
+    batches.map(batch =>
+      Promise.all(
+        batch.map(async ([relativePath, content]) => {
+          try {
+            const analysis = parseCodeFile(content, relativePath);
 
-          return {
-            fileId: relativePath,
-            fileName: path.basename(relativePath),
-            analysis,
-            success: true,
-          };
-        } catch (_error) {
-          return { fileId: relativePath, fileName: '', analysis: null, success: false };
-        }
-      })
-    );
+            return {
+              fileId: relativePath,
+              fileName: path.basename(relativePath),
+              analysis,
+              success: true,
+            };
+          } catch (_error) {
+            return { fileId: relativePath, fileName: '', analysis: null, success: false };
+          }
+        })
+      )
+    )
+  );
 
-    // Process batch results
+  for (const batchResults of allBatchResults) {
     for (const result of batchResults) {
       processedCount++;
       
-      // Only update progress every 10 files to reduce overhead
       if (processedCount % 10 === 0 || processedCount === filesToProcess.length) {
         onProgress?.(`Analyzing file ${processedCount}/${filesToProcess.length}...`);
       }
 
       if (!result.success || !result.analysis) continue;
 
-      // Add file node
       fileNodes.push({
         id: result.fileId,
         label: result.fileName,
         file: result.fileId,
       });
 
-      // Store imports
       if (result.analysis.imports.length > 0) {
         fileImports.set(result.fileId, new Set(result.analysis.imports));
       }
 
-      // Store functions and their calls
       if (result.analysis.functions.length > 0) {
         const functions = new Set<string>(result.analysis.functions.map((f: FunctionInfo) => f.name));
         fileFunctions.set(result.fileId, functions);
         
-        // Store function calls
         const calls = new Set<string>();
         result.analysis.functions.forEach((fn: FunctionInfo) => {
           fn.calls.forEach((call: string) => calls.add(call));
@@ -609,7 +567,6 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
 
   onProgress?.('Building file relationships...');
 
-  // Create file edges from imports
   fileImports.forEach((imports, sourceFile) => {
     imports.forEach((importPath) => {
       const targetFile = resolveImport(sourceFile, importPath, fileNodes);
@@ -623,29 +580,24 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
     });
   });
 
-  // Create edges based on function calls between files
   functionCalls.forEach((calls, sourceFile) => {
     calls.forEach((call) => {
-      // Find which file contains this function
-      fileFunctions.forEach((functions, targetFile) => {
-        if (targetFile !== sourceFile && functions.has(call)) {
-          fileEdges.push({
-            id: `${sourceFile}-calls-${targetFile}::${call}`,
-            source: sourceFile,
-            target: targetFile,
-          });
-        }
-      });
+      const targetFile = findFileForFunction(call, fileFunctions);
+      if (targetFile && targetFile !== sourceFile) {
+        fileEdges.push({
+          id: `${sourceFile}-calls-${targetFile}::${call}`,
+          source: sourceFile,
+          target: targetFile,
+        });
+      }
     });
   });
 
-  // Add directory-based relationships
   fileNodes.forEach((node, i) => {
     fileNodes.slice(i + 1).forEach((otherNode) => {
       const nodeDir = path.dirname(node.id);
       const otherDir = path.dirname(otherNode.id);
       
-      // Files in same directory often relate
       if (nodeDir === otherDir && nodeDir !== '.' && !hasEdge(fileEdges, node.id, otherNode.id)) {
         fileEdges.push({
           id: `${node.id}-samedir-${otherNode.id}`,
@@ -662,12 +614,9 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
   };
 }
 
-// Enhance with LLM from GitHub API-fetched files (serverless-compatible)
 async function enhanceWithLLMFromFiles(result: AnalysisResult, _files: Map<string, string>, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
   onProgress?.('Preparing AI analysis...');
   
-  // Skip LLM for GitHub API approach for now to keep it fast and simple
-  // Can be enhanced later with proper file digest creation
   return result;
 }
 
@@ -678,9 +627,8 @@ async function analyzeCode(repoPath: string, onProgress?: (progress: string) => 
   const fileFunctions = new Map<string, Set<string>>();
   const functionCalls = new Map<string, Set<string>>();
 
-  const maxFiles = 100; // Limit to prevent freeze on large repos
+  const maxFiles = 100;
 
-  // First, collect all file paths
   const allFiles: {filePath: string, relativePath: string}[] = [];
   await walkDirectory(repoPath, repoPath, async (filePath, relativePath) => {
     if (!shouldSkipFile(relativePath)) {
@@ -688,10 +636,8 @@ async function analyzeCode(repoPath: string, onProgress?: (progress: string) => 
     }
   });
 
-  // Limit to maxFiles
   const filesToProcess = allFiles.slice(0, maxFiles);
 
-  // Process files in parallel batches for better performance
   const batchSize = 10;
   const batches = [];
   for (let i = 0; i < filesToProcess.length; i += batchSize) {
@@ -719,35 +665,29 @@ async function analyzeCode(repoPath: string, onProgress?: (progress: string) => 
       })
     );
 
-    // Process batch results
     for (const result of batchResults) {
       processedCount++;
       
-      // Only update progress every 10 files to reduce overhead
       if (processedCount % 10 === 0 || processedCount === filesToProcess.length) {
         onProgress?.(`Analyzing file ${processedCount}/${filesToProcess.length}...`);
       }
 
       if (!result.success || !result.analysis) continue;
 
-      // Add file node
       fileNodes.push({
         id: result.fileId,
         label: result.fileName,
         file: result.fileId,
       });
 
-      // Store imports
       if (result.analysis.imports.length > 0) {
         fileImports.set(result.fileId, new Set(result.analysis.imports));
       }
 
-      // Store functions and their calls
       if (result.analysis.functions.length > 0) {
         const functions = new Set<string>(result.analysis.functions.map((f: FunctionInfo) => f.name));
         fileFunctions.set(result.fileId, functions);
         
-        // Store function calls
         const calls = new Set<string>();
         result.analysis.functions.forEach((fn: FunctionInfo) => {
           fn.calls.forEach((call: string) => calls.add(call));
@@ -761,7 +701,6 @@ async function analyzeCode(repoPath: string, onProgress?: (progress: string) => 
 
   onProgress?.('Building file relationships...');
 
-  // Create file edges from imports
   fileImports.forEach((imports, sourceFile) => {
     imports.forEach((importPath) => {
       const targetFile = resolveImport(sourceFile, importPath, fileNodes);
@@ -775,29 +714,24 @@ async function analyzeCode(repoPath: string, onProgress?: (progress: string) => 
     });
   });
 
-  // Create edges based on function calls between files
   functionCalls.forEach((calls, sourceFile) => {
     calls.forEach((call) => {
-      // Find which file contains this function
-      fileFunctions.forEach((functions, targetFile) => {
-        if (targetFile !== sourceFile && functions.has(call)) {
-          fileEdges.push({
-            id: `${sourceFile}-calls-${targetFile}::${call}`,
-            source: sourceFile,
-            target: targetFile,
-          });
-        }
-      });
+      const targetFile = findFileForFunction(call, fileFunctions);
+      if (targetFile && targetFile !== sourceFile) {
+        fileEdges.push({
+          id: `${sourceFile}-calls-${targetFile}::${call}`,
+          source: sourceFile,
+          target: targetFile,
+        });
+      }
     });
   });
 
-  // Add directory-based relationships
   fileNodes.forEach((node, i) => {
     fileNodes.slice(i + 1).forEach((otherNode) => {
       const nodeDir = path.dirname(node.id);
       const otherDir = path.dirname(otherNode.id);
       
-      // Files in same directory often relate
       if (nodeDir === otherDir && nodeDir !== '.' && !hasEdge(fileEdges, node.id, otherNode.id)) {
         fileEdges.push({
           id: `${node.id}-samedir-${otherNode.id}`,
@@ -822,17 +756,13 @@ async function enhanceWithLLM(result: AnalysisResult, repoPath: string, onProgre
   onProgress?.('Preparing AI analysis...');
 
   try {
-    // Skip LLM analysis for very small repos (< 5 files) - not worth the API call
     if (result.files.nodes.length < 5) {
       onProgress?.('Skipping AI analysis for small repository...');
       return result;
     }
 
-    // Create file digests for LLM analysis
-    onProgress?.('Creating file summaries for AI...');
     const fileDigests: LLMFileDigest[] = [];
 
-    // Process files in parallel for speed
     const digestPromises = result.files.nodes.map(async (node) => {
       const fullPath = path.join(repoPath, node.id);
       try {
@@ -842,7 +772,7 @@ async function enhanceWithLLM(result: AnalysisResult, repoPath: string, onProgre
         const digest: LLMFileDigest = {
           filePath: node.id,
           size: content.length,
-          preview: content.slice(0, 1500), // Reduced from 2000 for faster processing
+          preview: content.slice(0, 1500),
           imports: parsed.imports.map(imp => ({
             specifier: imp,
             resolved: imp,
@@ -870,21 +800,18 @@ async function enhanceWithLLM(result: AnalysisResult, repoPath: string, onProgre
       }
     });
 
-    // Filter out nulls and add to fileDigests
     const validDigests = (await Promise.all(digestPromises)).filter(d => d !== null) as LLMFileDigest[];
     fileDigests.push(...validDigests);
 
-    // Use LLM to infer relationships
     onProgress?.('Analyzing relationships with AI...');
     const llmResult = await inferRelationshipsWithLLM(fileDigests, {
-      maxFiles: 20, // Limit to prevent excessive API usage
+      maxFiles: 20,
     });
 
     if (llmResult) {
       apiCallCount++;
       onProgress?.('Processing AI results...');
 
-      // Add LLM-inferred relationships
       const enhancedEdges = [...result.files.edges];
 
       for (const edge of llmResult.fileEdges) {
@@ -911,14 +838,11 @@ async function enhanceWithLLM(result: AnalysisResult, repoPath: string, onProgre
     onProgress?.('AI analysis failed, using basic analysis...');
   }
 
-  // Fallback to basic heuristics if LLM fails
   onProgress?.('Enhancing relationships...');
   const enhancedEdges = [...result.files.edges];
 
-  // Look for common patterns
   result.files.nodes.forEach((node, i) => {
     result.files.nodes.slice(i + 1).forEach((otherNode) => {
-      // Files in same directory often relate
       const nodeDir = path.dirname(node.id);
       const otherDir = path.dirname(otherNode.id);
 
@@ -933,7 +857,6 @@ async function enhanceWithLLM(result: AnalysisResult, repoPath: string, onProgre
         }
       }
 
-      // Files with similar names might relate
       const nodeBase = path.basename(node.id, path.extname(node.id));
       const otherBase = path.basename(otherNode.id, path.extname(otherNode.id));
 
@@ -973,7 +896,6 @@ async function walkDirectory(
     const relativePath = path.relative(basePath, fullPath);
 
     if (entry.isDirectory()) {
-      // Skip common directories
       if (shouldSkipDirectory(entry.name)) continue;
       await walkDirectory(fullPath, basePath, callback);
     } else if (entry.isFile()) {
@@ -994,53 +916,29 @@ function shouldSkipDirectory(name: string): boolean {
 function shouldSkipFile(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
   const codeExtensions = [
-    // JavaScript/TypeScript
     '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
-    // Python
     '.py', '.pyw', '.pyx',
-    // Java/JVM
     '.java', '.kt', '.kts', '.scala', '.groovy',
-    // C/C++
     '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hh', '.hxx',
-    // C#/.NET
     '.cs', '.fs', '.vb',
-    // Go
     '.go',
-    // Rust
     '.rs',
-    // Ruby
     '.rb', '.rake',
-    // PHP
     '.php', '.phtml',
-    // Swift/Objective-C
     '.swift', '.m', '.mm',
-    // Web
     '.vue', '.svelte', '.astro',
-    // Dart
     '.dart',
-    // Shell
     '.sh', '.bash', '.zsh', '.fish',
-    // R
     '.r', '.R',
-    // Julia
     '.jl',
-    // Lua
     '.lua',
-    // Elixir
     '.ex', '.exs',
-    // Haskell
     '.hs',
-    // OCaml
     '.ml', '.mli',
-    // Erlang
     '.erl',
-    // Clojure
     '.clj', '.cljs', '.cljc',
-    // Perl
     '.pl', '.pm',
-    // SQL
     '.sql',
-    // Other
     '.zig', '.nim', '.v', '.sol',
   ];
   
@@ -1056,7 +954,6 @@ function resolveImport(
   importPath: string,
   allFiles: FileNode[]
 ): string | null {
-  // Simple resolution - find file that matches the import
   const normalized = importPath.replace(/^[\.\/]+/, '').replace(/\.(js|ts|jsx|tsx)$/, '');
   
   for (const file of allFiles) {
@@ -1066,5 +963,14 @@ function resolveImport(
     }
   }
 
+  return null;
+}
+
+function findFileForFunction(functionName: string, fileFunctions: Map<string, Set<string>>): string | null {
+  for (const [file, functions] of fileFunctions.entries()) {
+    if (functions.has(functionName)) {
+      return file;
+    }
+  }
   return null;
 }

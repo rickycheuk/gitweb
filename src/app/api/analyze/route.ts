@@ -100,18 +100,24 @@ export async function POST(request: NextRequest) {
       },
     });
 
+    // OPTIMIZATION: Debounce progress updates to reduce database writes
+    let lastProgressUpdate = Date.now();
+    const progressUpdateInterval = 2000; // Update DB max once per 2 seconds
+
     // Start analysis in background
     analyzeRepository(repoUrl, async (progress: string) => {
+      const now = Date.now();
+      // Only update database if 2+ seconds have passed since last update
+      if (now - lastProgressUpdate < progressUpdateInterval) {
+        return; // Skip this update
+      }
+      
+      lastProgressUpdate = now;
+      
       try {
-        await prisma.analysisProgress.upsert({
+        await prisma.analysisProgress.update({
           where: { sessionId },
-          create: {
-            sessionId,
-            progress,
-          },
-          update: {
-            progress,
-          },
+          data: { progress },
         });
       } catch (err) {
         console.warn('Failed to update progress:', err);

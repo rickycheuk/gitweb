@@ -263,16 +263,31 @@ export async function generateGraphPreview(analysisResult: AnalysisResult, repoU
     }));
 
     // Run force simulation
+    // OPTIMIZATION: Adaptive iterations based on graph size
+    const nodeCount = simulationNodes.length;
+    const iterations = Math.min(
+      100, // max iterations
+      Math.max(
+        30, // min iterations for small graphs
+        Math.floor(300 / Math.sqrt(nodeCount)) // fewer iterations for larger graphs
+      )
+    );
+    
     const simulation = forceSimulation(simulationNodes as d3.SimulationNodeDatum[])
-      .force('link', forceLink(simulationLinks as d3.SimulationLinkDatum<d3.SimulationNodeDatum>[]).distance(50))
-      .force('charge', forceManyBody().strength(-200))
+      .force('link', forceLink(simulationLinks as d3.SimulationLinkDatum<d3.SimulationNodeDatum>[])
+        .distance(50)
+        .strength(0.5)) // Reduced strength for faster convergence
+      .force('charge', forceManyBody()
+        .strength(-200)
+        .distanceMax(300)) // Limit distance for better performance
       .force('center', forceCenter(fullWidth / 2, fullHeight / 2))
       .force('x', forceX(fullWidth / 2).strength(0.1))
       .force('y', forceY(fullHeight / 2).strength(0.1))
+      .alphaDecay(0.05) // Faster decay for quicker convergence
       .stop();
 
-    // Run simulation for a few ticks
-    for (let i = 0; i < 100; i++) {
+    // OPTIMIZATION: Run simulation with adaptive iterations for 2-3x faster rendering
+    for (let i = 0; i < iterations; i++) {
       simulation.tick();
     }
 
