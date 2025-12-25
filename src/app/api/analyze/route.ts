@@ -110,7 +110,19 @@ export async function POST(request: NextRequest) {
     let lastProgressUpdate = Date.now();
     const progressUpdateInterval = 500; // Update DB max once per 500ms for smoother progress
 
+    // Update progress immediately to show analysis is starting
+    try {
+      await prisma.analysisProgress.update({
+        where: { sessionId },
+        data: { progress: JSON.stringify({ message: 'Initializing analysis...' }) },
+      });
+    } catch (err) {
+      console.warn('Failed to update initial progress:', err);
+    }
+
     // Start analysis in background
+    // On Vercel, serverless functions continue executing after response is sent
+    // until they hit the timeout (10s for free tier, 60s for pro)
     analyzeRepository(repoUrl, async (progress: string | ProgressData) => {
       const now = Date.now();
       // Only update database if 500ms+ have passed since last update
@@ -147,12 +159,13 @@ export async function POST(request: NextRequest) {
         console.error('Failed to save final result:', err);
       }
     }).catch(async (error) => {
+      console.error('Analysis failed:', error);
       try {
         await prisma.analysisProgress.update({
           where: { sessionId },
           data: {
             progress: 'error',
-            error: error.message,
+            error: error instanceof Error ? error.message : String(error),
           },
         });
       } catch (err) {

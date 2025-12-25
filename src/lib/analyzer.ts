@@ -143,6 +143,9 @@ type FileParseResult = {
 export type ProgressCallback = (progress: string | { message: string; filesAnalyzed?: number; totalFiles?: number }) => void;
 
 export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCallback): Promise<AnalysisResult> {
+  // Immediately send progress to show analysis has started
+  onProgress?.({ message: 'Starting repository analysis...' });
+  
   const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+?)(\.git)?$/);
   if (!match) {
     throw new Error('Invalid GitHub URL');
@@ -160,6 +163,7 @@ export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCa
     },
   }).catch(err => console.warn('Failed to record search analytics:', err));
 
+  onProgress?.({ message: 'Checking cache...' });
   const cachedResult = await checkCache(repoUrl, '');
   if (cachedResult) {
     // Check if cached images actually exist in S3, regenerate if missing
@@ -209,27 +213,35 @@ export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCa
     return cachedResult;
   }
 
+  // Immediately send progress update to ensure client sees activity
   onProgress?.({ message: 'Fetching repository files...' });
-  const files = await fetchFilesFromGitHub(owner, repo);
   
-  if (files.size === 0) {
-    throw new Error('No code files found in repository');
+  try {
+    const files = await fetchFilesFromGitHub(owner, repo);
+    
+    if (files.size === 0) {
+      throw new Error('No code files found in repository');
+    }
+
+    const commitHash = await getLatestCommitFromGitHub(repoUrl) || 'unknown';
+
+    onProgress?.({ message: 'Analyzing code structure...', filesAnalyzed: 0, totalFiles: Math.min(files.size, 100) });
+    const result = await analyzeCodeFromFiles(files, onProgress);
+
+    onProgress?.({ message: 'Building relationships...' });
+    const enhancedResult = await enhanceWithLLMFromFiles(result, files, onProgress);
+
+    // Cache the result (this will try to generate images, but won't fail if images fail)
+    // The analysis result is always saved, even if image generation fails
+    await cacheResult(repoUrl, repoName, owner, repo, commitHash, result.files.nodes.length, enhancedResult);
+
+    onProgress?.({ message: 'Finalizing...' });
+    return enhancedResult;
+  } catch (error) {
+    console.error(`Error during analysis for ${repoUrl}:`, error);
+    onProgress?.({ message: `Error: ${error instanceof Error ? error.message : String(error)}` });
+    throw error;
   }
-
-  const commitHash = await getLatestCommitFromGitHub(repoUrl) || 'unknown';
-
-  onProgress?.({ message: 'Analyzing code structure...', filesAnalyzed: 0, totalFiles: Math.min(files.size, 100) });
-  const result = await analyzeCodeFromFiles(files, onProgress);
-
-  onProgress?.({ message: 'Building relationships...' });
-  const enhancedResult = await enhanceWithLLMFromFiles(result, files, onProgress);
-
-  // Cache the result (this will try to generate images, but won't fail if images fail)
-  // The analysis result is always saved, even if image generation fails
-  await cacheResult(repoUrl, repoName, owner, repo, commitHash, result.files.nodes.length, enhancedResult);
-
-  onProgress?.({ message: 'Finalizing...' });
-  return enhancedResult;
 }
 
 async function checkCache(repoUrl: string, _repoPath: string): Promise<AnalysisResult | null> {
