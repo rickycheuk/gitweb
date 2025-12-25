@@ -22,30 +22,30 @@ interface TrendingSectionProps {
 }
 
 export default function TrendingSection({ onRepoSelect }: TrendingSectionProps = {}) {
-  const [dailyTrending, setDailyTrending] = useState<TrendingRepo[]>([]);
   const [weeklyTrending, setWeeklyTrending] = useState<TrendingRepo[]>([]);
   const [monthlyTrending, setMonthlyTrending] = useState<TrendingRepo[]>([]);
+  const [allTimeTrending, setAllTimeTrending] = useState<TrendingRepo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'daily' | 'weekly' | 'monthly'>('weekly');
+  const [activeTab, setActiveTab] = useState<'weekly' | 'monthly' | 'alltime'>('weekly');
 
   useEffect(() => {
     const fetchTrending = async () => {
       try {
-        const [dailyRes, weeklyRes, monthlyRes] = await Promise.all([
-          fetch('/api/trending?period=daily'),
+        const [weeklyRes, monthlyRes, allTimeRes] = await Promise.all([
           fetch('/api/trending?period=weekly'),
           fetch('/api/trending?period=monthly'),
+          fetch('/api/trending?period=alltime'),
         ]);
 
-        const [dailyData, weeklyData, monthlyData] = await Promise.all([
-          dailyRes.json(),
+        const [weeklyData, monthlyData, allTimeData] = await Promise.all([
           weeklyRes.json(),
           monthlyRes.json(),
+          allTimeRes.json(),
         ]);
 
-        setDailyTrending(dailyData.trending || []);
         setWeeklyTrending(weeklyData.trending || []);
         setMonthlyTrending(monthlyData.trending || []);
+        setAllTimeTrending(allTimeData.trending || []);
       } catch (error) {
         console.error('Failed to fetch trending data:', error);
       } finally {
@@ -58,12 +58,12 @@ export default function TrendingSection({ onRepoSelect }: TrendingSectionProps =
 
   const getCurrentTrending = () => {
     switch (activeTab) {
-      case 'daily':
-        return dailyTrending;
       case 'weekly':
         return weeklyTrending;
       case 'monthly':
         return monthlyTrending;
+      case 'alltime':
+        return allTimeTrending;
     }
   };
 
@@ -95,9 +95,9 @@ export default function TrendingSection({ onRepoSelect }: TrendingSectionProps =
       {/* Tab Navigation */}
       <div style={{ display: 'flex', gap: '0.25rem', marginBottom: '1.5rem', backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: '0.25rem', borderRadius: '0.5rem' }}>
         {[
-          { key: 'daily', label: 'Daily' },
-          { key: 'weekly', label: 'Weekly' },
-          { key: 'monthly', label: 'Monthly' },
+          { key: 'weekly', label: '1 Week' },
+          { key: 'monthly', label: '1 Month' },
+          { key: 'alltime', label: 'All Time' },
         ].map((tab) => (
           <button
             key={tab.key}
