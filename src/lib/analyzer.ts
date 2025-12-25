@@ -423,7 +423,8 @@ async function cacheResult(
     const updateData: {
       commitHash: string;
       fileCount: number;
-      analysisResult: unknown;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      analysisResult: any;
       updatedAt: Date;
       imageUrl?: string | null;
       previewImageUrl?: string | null;
