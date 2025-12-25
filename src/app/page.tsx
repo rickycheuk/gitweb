@@ -7,12 +7,19 @@ import { Loader2, Linkedin } from 'lucide-react';
 import GraphVisualization from '@/components/GraphVisualization';
 import TrendingSection from '@/components/TrendingSection';
 
+interface ProgressData {
+  message: string;
+  filesAnalyzed?: number;
+  totalFiles?: number;
+}
+
 export default function Home() {
   const { data: session } = useSession();
   const [repoUrl, setRepoUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [graphData, setGraphData] = useState(null);
   const [error, setError] = useState('');
+  const [progress, setProgress] = useState<ProgressData | string | null>(null);
 
   const analyzeRepo = async (overrideRepoUrl?: string) => {
     const urlToUse = overrideRepoUrl || repoUrl;
@@ -49,6 +56,7 @@ export default function Home() {
             clearInterval(pollInterval);
             setError('Failed to check progress');
             setLoading(false);
+            setProgress(null);
             return;
           }
 
@@ -58,15 +66,21 @@ export default function Home() {
             clearInterval(pollInterval);
             setGraphData(progressData.result);
             setLoading(false);
+            setProgress(null);
           } else if (progressData.progress === 'error') {
             clearInterval(pollInterval);
             setError(progressData.error || 'Analysis failed');
             setLoading(false);
+            setProgress(null);
+          } else {
+            // Update progress
+            setProgress(progressData.progress);
           }
         } catch (err) {
           clearInterval(pollInterval);
           setError('Failed to check progress');
           setLoading(false);
+          setProgress(null);
         }
       }, 1000);
 
@@ -262,6 +276,53 @@ export default function Home() {
                     'Visualize'
                   )}
                 </button>
+
+                {/* Progress Bar */}
+                {loading && progress && (
+                  <div style={{
+                    width: '100%',
+                    marginTop: '1rem',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem'
+                  }}>
+                    <div style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      fontSize: '0.875rem',
+                      color: 'rgba(255, 255, 255, 0.7)'
+                    }}>
+                      <span>
+                        {typeof progress === 'object' && progress.message 
+                          ? progress.message 
+                          : typeof progress === 'string' 
+                          ? progress 
+                          : 'Analyzing...'}
+                      </span>
+                      {typeof progress === 'object' && progress.filesAnalyzed !== undefined && progress.totalFiles !== undefined && (
+                        <span>{progress.filesAnalyzed}/{progress.totalFiles}</span>
+                      )}
+                    </div>
+                    {typeof progress === 'object' && progress.filesAnalyzed !== undefined && progress.totalFiles !== undefined && progress.totalFiles > 0 && (
+                      <div style={{
+                        width: '100%',
+                        height: '0.5rem',
+                        backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                        borderRadius: '0.25rem',
+                        overflow: 'hidden'
+                      }}>
+                        <div style={{
+                          height: '100%',
+                          backgroundColor: 'white',
+                          width: `${(progress.filesAnalyzed / progress.totalFiles) * 100}%`,
+                          transition: 'width 0.3s ease-out',
+                          borderRadius: '0.25rem'
+                        }} />
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </motion.div>
 

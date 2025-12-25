@@ -1,11 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { analyzeRepository, getApiCallCount, resetApiCallCount } from '@/lib/analyzer';
+import { analyzeRepository, getApiCallCount, resetApiCallCount, type ProgressCallback } from '@/lib/analyzer';
 import { prisma } from '@/lib/db';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 
 // Extend timeout for Vercel Pro (60s max) or keep at 10s for free tier
 export const maxDuration = 10; // seconds
+
+interface ProgressData {
+  message: string;
+  filesAnalyzed?: number;
+  totalFiles?: number;
+}
 
 interface AnalysisResult {
   summary?: string;
@@ -102,12 +108,12 @@ export async function POST(request: NextRequest) {
 
     // OPTIMIZATION: Debounce progress updates to reduce database writes
     let lastProgressUpdate = Date.now();
-    const progressUpdateInterval = 2000; // Update DB max once per 2 seconds
+    const progressUpdateInterval = 500; // Update DB max once per 500ms for smoother progress
 
     // Start analysis in background
-    analyzeRepository(repoUrl, async (progress: string) => {
+    analyzeRepository(repoUrl, async (progress: string | ProgressData) => {
       const now = Date.now();
-      // Only update database if 2+ seconds have passed since last update
+      // Only update database if 500ms+ have passed since last update
       if (now - lastProgressUpdate < progressUpdateInterval) {
         return; // Skip this update
       }
@@ -115,9 +121,14 @@ export async function POST(request: NextRequest) {
       lastProgressUpdate = now;
       
       try {
+        // Convert progress to JSON string if it's an object
+        const progressString = typeof progress === 'string' 
+          ? progress 
+          : JSON.stringify(progress);
+        
         await prisma.analysisProgress.update({
           where: { sessionId },
-          data: { progress },
+          data: { progress: progressString },
         });
       } catch (err) {
         console.warn('Failed to update progress:', err);
@@ -186,8 +197,20 @@ export async function GET(request: NextRequest) {
       },
     }).catch((err: unknown) => console.warn('Failed to cleanup old progress:', err));
 
+    // Parse progress if it's JSON
+    let progress: string | ProgressData = progressData.progress;
+    try {
+      const parsed = JSON.parse(progressData.progress);
+      if (typeof parsed === 'object' && parsed.message) {
+        progress = parsed;
+      }
+    } catch {
+      // If parsing fails, use as string
+      progress = progressData.progress;
+    }
+
     return NextResponse.json({
-      progress: progressData.progress,
+      progress,
       timestamp: progressData.updatedAt.getTime(),
       result: progressData.result,
       error: progressData.error,

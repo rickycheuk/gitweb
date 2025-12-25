@@ -7,10 +7,11 @@ import crypto from 'crypto';
 // Increment this version whenever visualization logic changes to force regeneration
 const GRAPH_VERSION = '2';
 
-function extractS3KeyFromUrl(url: string): string | null {
+export function extractS3KeyFromUrl(url: string): string | null {
   try {
     const urlObj = new URL(url);
-    const key = urlObj.pathname.substring(1);
+    // Remove leading slash from pathname and query params
+    const key = urlObj.pathname.substring(1).split('?')[0];
     return key;
   } catch (error) {
     return null;
@@ -354,15 +355,19 @@ export async function generateGraphPreview(analysisResult: AnalysisResult, repoU
       throw error;
     }
 
-  // Generate unique key with consistent filename
+  // Generate unique key with consistent filename and timestamp
   const repoName = repoUrl.replace('https://github.com/', '').replace('/', '_');
   const sanitizedRepoName = repoName.replace(/[^a-z0-9_-]/gi, '_');
   const timestampSegment = Date.now().toString();
   const baseFileName = `gitweb-${sanitizedRepoName}${isPreview ? '-preview' : ''}.png`;
   const key = `previews/${sanitizedRepoName}/${timestampSegment}/${baseFileName}`;
 
+    console.log(`[generateGraphPreview] Uploading ${isPreview ? 'preview' : 'full'} image to S3: ${key} (${buffer.length} bytes)`);
+    
     // Upload to S3
     const imageUrl = await uploadImageToS3(buffer, key);
+    
+    console.log(`[generateGraphPreview] Successfully uploaded to S3, URL: ${imageUrl?.substring(0, 100)}...`);
 
     return imageUrl;
   } catch (error) {

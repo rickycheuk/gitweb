@@ -7,8 +7,8 @@ import { createGunzip } from 'node:zlib';
 import { parseCodeFile, type FunctionInfo } from './parser';
 import { inferRelationshipsWithLLM, type LLMFileDigest } from './llm';
 import { prisma } from './db';
-import { generateGraphPreview } from './graphPreview';
-import { deleteImageFromS3 } from './s3';
+import { generateGraphPreview, extractS3KeyFromUrl } from './graphPreview';
+import { deleteImageFromS3, checkImageExistsInS3 } from './s3';
 import tar from 'tar-stream';
 import type { Headers as TarHeaders } from 'tar-stream';
 import type { PassThrough } from 'node:stream';
@@ -140,7 +140,9 @@ type FileParseResult = {
   analysis: ReturnType<typeof parseCodeFile> | null;
 };
 
-export async function analyzeRepository(repoUrl: string, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
+export type ProgressCallback = (progress: string | { message: string; filesAnalyzed?: number; totalFiles?: number }) => void;
+
+export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCallback): Promise<AnalysisResult> {
   const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+?)(\.git)?$/);
   if (!match) {
     throw new Error('Invalid GitHub URL');
@@ -160,10 +162,54 @@ export async function analyzeRepository(repoUrl: string, onProgress?: (progress:
 
   const cachedResult = await checkCache(repoUrl, '');
   if (cachedResult) {
-    onProgress?.('Loaded from cache');
+    // Check if cached images actually exist in S3, regenerate if missing
+    onProgress?.({ message: 'Verifying cached images...' });
+    const cached = await prisma.repositoryCache.findUnique({
+      where: { repoUrl },
+      select: { previewImageUrl: true, imageUrl: true, analysisResult: true }
+    });
+
+    if (cached) {
+      let needsRegeneration = false;
+      
+      // Check if preview image exists in S3
+      if (cached.previewImageUrl) {
+        const s3Key = extractS3KeyFromUrl(cached.previewImageUrl);
+        if (s3Key) {
+          const exists = await checkImageExistsInS3(s3Key);
+          if (!exists) {
+            console.log(`Preview image not found in S3 for ${repoUrl}, will regenerate`);
+            needsRegeneration = true;
+          }
+        }
+      } else {
+        needsRegeneration = true;
+      }
+
+      // If preview is missing, regenerate it
+      if (needsRegeneration && cached.analysisResult) {
+        onProgress?.({ message: 'Regenerating missing preview image...' });
+        const analysisResult = cached.analysisResult as unknown as AnalysisResult;
+        try {
+          const newPreviewUrl = await generateGraphPreview(analysisResult, repoUrl, true);
+          if (newPreviewUrl) {
+            await prisma.repositoryCache.update({
+              where: { repoUrl },
+              data: { previewImageUrl: newPreviewUrl }
+            });
+            console.log(`Regenerated preview image for ${repoUrl}`);
+          }
+        } catch (error) {
+          console.warn(`Failed to regenerate preview for ${repoUrl}:`, error);
+        }
+      }
+    }
+
+    onProgress?.({ message: 'Loaded from cache' });
     return cachedResult;
   }
 
+  onProgress?.({ message: 'Fetching repository files...' });
   const files = await fetchFilesFromGitHub(owner, repo);
   
   if (files.size === 0) {
@@ -172,15 +218,17 @@ export async function analyzeRepository(repoUrl: string, onProgress?: (progress:
 
   const commitHash = await getLatestCommitFromGitHub(repoUrl) || 'unknown';
 
-  onProgress?.('Analyzing code structure...');
+  onProgress?.({ message: 'Analyzing code structure...', filesAnalyzed: 0, totalFiles: Math.min(files.size, 100) });
   const result = await analyzeCodeFromFiles(files, onProgress);
 
-  onProgress?.('Building relationships...');
+  onProgress?.({ message: 'Building relationships...' });
   const enhancedResult = await enhanceWithLLMFromFiles(result, files, onProgress);
 
+  // Cache the result (this will try to generate images, but won't fail if images fail)
+  // The analysis result is always saved, even if image generation fails
   await cacheResult(repoUrl, repoName, owner, repo, commitHash, result.files.nodes.length, enhancedResult);
 
-  onProgress?.('Finalizing...');
+  onProgress?.({ message: 'Finalizing...' });
   return enhancedResult;
 }
 
@@ -315,40 +363,90 @@ async function cacheResult(
       : null;
 
     const isContentMatch = storedContentHash === contentHash;
-    const hasValidFullImage = cached?.imageUrl && isContentMatch;
-    const hasValidPreviewImage = cached?.previewImageUrl && isContentMatch;
+    
+    let imageUrl: string | null = cached?.imageUrl || null;
+    let previewImageUrl: string | null = cached?.previewImageUrl || null;
 
-    let imageUrl: string | null = null;
-    let previewImageUrl: string | null = null;
+    // Always generate new images - each analysis creates new previews with unique timestamps in S3
+    // This ensures we always have fresh preview images in S3
+    try {
+      // Always generate full image (it's fast and ensures consistency)
+      console.log(`Generating new full image for ${repoUrl}`);
+      const generatedImageUrl = await generateGraphPreview(analysisResult, repoUrl, false);
+      if (generatedImageUrl) {
+        imageUrl = generatedImageUrl;
+        console.log(`Successfully generated full image for ${repoUrl}: ${generatedImageUrl.substring(0, 100)}...`);
+      } else {
+        console.warn(`Failed to generate full image for ${repoUrl} (returned null)`);
+      }
 
-    if (!hasValidFullImage) {
-      imageUrl = await generateGraphPreview(analysisResult, repoUrl, false);
-    } else {
-      imageUrl = cached!.imageUrl;
+      // Always generate preview image - creates new preview with new timestamp in S3
+      console.log(`Generating new preview image for ${repoUrl}`);
+      const generatedPreviewUrl = await generateGraphPreview(analysisResult, repoUrl, true);
+      if (generatedPreviewUrl) {
+        // Verify the image was actually uploaded to S3
+        const s3Key = extractS3KeyFromUrl(generatedPreviewUrl);
+        if (s3Key) {
+          const exists = await checkImageExistsInS3(s3Key);
+          if (exists) {
+            previewImageUrl = generatedPreviewUrl;
+            console.log(`Successfully generated and verified preview image for ${repoUrl}: ${generatedPreviewUrl.substring(0, 100)}...`);
+          } else {
+            console.warn(`Preview image generated but not found in S3 for ${repoUrl}, will retry`);
+            // Retry once
+            const retryPreviewUrl = await generateGraphPreview(analysisResult, repoUrl, true);
+            if (retryPreviewUrl) {
+              previewImageUrl = retryPreviewUrl;
+              console.log(`Successfully regenerated preview image for ${repoUrl}`);
+            }
+          }
+        } else {
+          previewImageUrl = generatedPreviewUrl;
+        }
+      } else {
+        console.warn(`Failed to generate preview image for ${repoUrl} (returned null)`);
+      }
+    } catch (imageError) {
+      console.error(`Failed to generate images for ${repoUrl}:`, imageError);
+      // Continue to save the analysis result even if images fail
+      // Use cached images as fallback if generation fails
+      if (!imageUrl) {
+        imageUrl = cached?.imageUrl || null;
+      }
+      if (!previewImageUrl) {
+        previewImageUrl = cached?.previewImageUrl || null;
+      }
     }
 
-    if (!hasValidPreviewImage) {
-      previewImageUrl = await generateGraphPreview(analysisResult, repoUrl, true);
-    } else {
-      previewImageUrl = cached!.previewImageUrl;
-    }
+    // Save the analysis result regardless of whether images were generated
+    // This ensures the analysis is cached and images can be generated later
+    const updateData: {
+      commitHash: string;
+      fileCount: number;
+      analysisResult: unknown;
+      updatedAt: Date;
+      imageUrl?: string | null;
+      previewImageUrl?: string | null;
+    } = {
+      commitHash: combinedHash,
+      fileCount,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      analysisResult: analysisResult as any,
+      updatedAt: new Date(),
+    };
 
-    if (!imageUrl || !previewImageUrl) {
-      console.error(`Failed to get/generate images for ${repoUrl}`);
-      return;
+    // Only update image URLs if they were generated (not null)
+    // This preserves existing images if generation failed
+    if (imageUrl !== null) {
+      updateData.imageUrl = imageUrl;
+    }
+    if (previewImageUrl !== null) {
+      updateData.previewImageUrl = previewImageUrl;
     }
 
     await prisma.repositoryCache.upsert({
       where: { repoUrl },
-      update: {
-        commitHash: combinedHash,
-        fileCount,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        analysisResult: analysisResult as any,
-        imageUrl,
-        previewImageUrl,
-        updatedAt: new Date(),
-      },
+      update: updateData,
       create: {
         repoUrl,
         repoName,
@@ -358,8 +456,8 @@ async function cacheResult(
         fileCount,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         analysisResult: analysisResult as any,
-        imageUrl,
-        previewImageUrl,
+        imageUrl: imageUrl || null,
+        previewImageUrl: previewImageUrl || null,
       },
     });
   } catch (error) {
@@ -561,7 +659,7 @@ async function fetchFilesViaTree(params: {
   } else {
     const treeResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, {
       headers: { ...baseHeaders },
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(5000) 
     });
     if (!treeResponse.ok) {
       throw new Error(`Failed to fetch tree: ${treeResponse.status}`);
@@ -683,7 +781,7 @@ async function removeDirectoryForce(dirPath: string): Promise<void> {
   throw new Error(`Failed to remove directory after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`);
 }
 
-async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
+async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: ProgressCallback): Promise<AnalysisResult> {
   const fileNodes: FileNode[] = [];
   const fileEdges: Edge[] = [];
   const fileImports = new Map<string, Set<string>>();
@@ -692,23 +790,27 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
 
   const maxFiles = 100;
   const filesToProcess = Array.from(files.entries()).slice(0, maxFiles);
-  if (filesToProcess.length === 0) {
+  const totalFiles = filesToProcess.length;
+  
+  if (totalFiles === 0) {
     return {
       files: { nodes: [], edges: [] },
       functions: { nodes: [], edges: [] },
     };
   }
 
-  const results: FileParseResult[] = new Array(filesToProcess.length);
-  const concurrency = Math.min(50, filesToProcess.length);
+  const results: FileParseResult[] = new Array(totalFiles);
+  const concurrency = Math.min(50, totalFiles);
   let index = 0;
   let processedCount = 0;
+  let lastProgressUpdate = Date.now();
+  const PROGRESS_UPDATE_INTERVAL = 200; // Update every 200ms max
 
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
       for (;;) {
         const currentIndex = index++;
-        if (currentIndex >= filesToProcess.length) {
+        if (currentIndex >= totalFiles) {
           break;
         }
 
@@ -730,8 +832,15 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
           };
         } finally {
           processedCount += 1;
-          if (processedCount % 10 === 0 || processedCount === filesToProcess.length) {
-            onProgress?.(`Analyzing file ${processedCount}/${filesToProcess.length}...`);
+          const now = Date.now();
+          // Update progress more frequently but throttle to avoid too many updates
+          if (now - lastProgressUpdate >= PROGRESS_UPDATE_INTERVAL || processedCount === totalFiles) {
+            lastProgressUpdate = now;
+            onProgress?.({
+              message: `Analyzing files... ${processedCount}/${totalFiles}`,
+              filesAnalyzed: processedCount,
+              totalFiles: totalFiles,
+            });
           }
         }
       }
@@ -767,7 +876,7 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
     }
   }
 
-  onProgress?.('Building file relationships...');
+  onProgress?.({ message: 'Building file relationships...' });
 
   fileImports.forEach((imports, sourceFile) => {
     imports.forEach((importPath) => {
@@ -816,8 +925,8 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: (pr
   };
 }
 
-async function enhanceWithLLMFromFiles(result: AnalysisResult, _files: Map<string, string>, onProgress?: (progress: string) => void): Promise<AnalysisResult> {
-  onProgress?.('Preparing AI analysis...');
+async function enhanceWithLLMFromFiles(result: AnalysisResult, _files: Map<string, string>, onProgress?: ProgressCallback): Promise<AnalysisResult> {
+  onProgress?.({ message: 'Preparing AI analysis...' });
   
   return result;
 }

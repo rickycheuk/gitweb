@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 let s3Client: S3Client | null = null;
@@ -41,9 +41,11 @@ export async function uploadImageToS3(buffer: Buffer, key: string, contentType: 
   });
 
   try {
+    console.log(`[S3] Uploading ${key} (${buffer.length} bytes) to bucket ${bucketName}`);
     const result = await getS3Client().send(command);
+    console.log(`[S3] Successfully uploaded ${key}, ETag: ${result.ETag || 'N/A'}`);
   } catch (error) {
-    console.error('Failed to upload to S3:', error);
+    console.error(`[S3] Failed to upload ${key} to S3:`, error);
     throw error;
   }
 
@@ -108,5 +110,76 @@ export async function deleteImageFromS3(key: string): Promise<boolean> {
   } catch (error: unknown) {
     console.error(`Error deleting image from S3: ${key}`, error);
     return false;
+  }
+}
+
+/**
+ * Get the latest preview image URL for a repository from S3
+ * Searches all preview images for the repo and returns the most recent one
+ */
+export async function getLatestPreviewImageFromS3(repoUrl: string): Promise<string | null> {
+  const bucketName = process.env.AWS_S3_BUCKET_NAME!;
+
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY || !bucketName) {
+    console.error('Missing AWS credentials for listing images');
+    return null;
+  }
+
+  try {
+    // Extract repo name from URL
+    const repoName = repoUrl.replace('https://github.com/', '').replace('/', '_');
+    const sanitizedRepoName = repoName.replace(/[^a-z0-9_-]/gi, '_');
+    const prefix = `previews/${sanitizedRepoName}/`;
+
+    // List all objects with this prefix
+    const command = new ListObjectsV2Command({
+      Bucket: bucketName,
+      Prefix: prefix,
+    });
+
+    const response = await getS3Client().send(command);
+
+    if (!response.Contents || response.Contents.length === 0) {
+      return null;
+    }
+
+    // Filter for preview images only
+    const previewImages = response.Contents.filter(obj => 
+      obj.Key && obj.Key.includes('-preview.png')
+    );
+
+    if (previewImages.length === 0) {
+      return null;
+    }
+
+    // Sort by LastModified date (most recent first)
+    const sortedImages = previewImages.sort((a, b) => {
+      const dateA = a.LastModified?.getTime() || 0;
+      const dateB = b.LastModified?.getTime() || 0;
+      return dateB - dateA;
+    });
+
+    const latestImage = sortedImages[0];
+    if (!latestImage.Key) {
+      return null;
+    }
+
+    // Generate a signed URL for the latest image
+    const getObjectCommand = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: latestImage.Key,
+    });
+
+    try {
+      const signedUrl = await getSignedUrl(getS3Client(), getObjectCommand, { expiresIn: 604800 }); // 1 week
+      return signedUrl;
+    } catch (error) {
+      console.error('Failed to generate signed URL for latest preview:', error);
+      // Fallback to public URL
+      return `https://${bucketName}.s3.amazonaws.com/${latestImage.Key}`;
+    }
+  } catch (error) {
+    console.error(`Error getting latest preview image from S3 for ${repoUrl}:`, error);
+    return null;
   }
 }
