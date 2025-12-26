@@ -733,8 +733,8 @@ async function fetchFilesViaTree(params: {
     rawHeaders['Authorization'] = `token ${token}`;
   }
 
-  const batchSize = 50;
-  const batches = [];
+  const batchSize = 100; // Increased batch size for faster fetching
+  const batches: Array<typeof codeFiles> = [];
   for (let i = 0; i < codeFiles.length; i += batchSize) {
     batches.push(codeFiles.slice(i, i + batchSize));
   }
@@ -837,7 +837,7 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: Pro
   const fileFunctions = new Map<string, Set<string>>();
   const functionCalls = new Map<string, Set<string>>();
 
-  const maxFiles = 100;
+  const maxFiles = 200; // Increased from 100 to analyze more files
   const filesToProcess = Array.from(files.entries()).slice(0, maxFiles);
   const totalFiles = filesToProcess.length;
   
@@ -849,11 +849,11 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: Pro
   }
 
   const results: FileParseResult[] = new Array(totalFiles);
-  const concurrency = Math.min(50, totalFiles);
+  const concurrency = Math.min(100, totalFiles); // Increased concurrency for faster processing
   let index = 0;
   let processedCount = 0;
   let lastProgressUpdate = Date.now();
-  const PROGRESS_UPDATE_INTERVAL = 200; // Update every 200ms max
+  const PROGRESS_UPDATE_INTERVAL = 100; // Update every 100ms for more responsive progress
 
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
@@ -925,47 +925,75 @@ async function analyzeCodeFromFiles(files: Map<string, string>, onProgress?: Pro
     }
   }
 
-  onProgress?.({ message: 'Building file relationships...' });
+  onProgress?.({ message: 'Building file relationships...', filesAnalyzed: totalFiles, totalFiles: totalFiles });
 
+  // Build edges from imports - use Set to track seen edges for deduplication
+  const seenEdges = new Set<string>();
+  
   fileImports.forEach((imports, sourceFile) => {
     imports.forEach((importPath) => {
       const targetFile = resolveImport(sourceFile, importPath, fileNodes);
       if (targetFile && targetFile !== sourceFile) {
-        fileEdges.push({
-          id: `${sourceFile}->${targetFile}`,
-          source: sourceFile,
-          target: targetFile,
-        });
+        const edgeId = `${sourceFile}->${targetFile}`;
+        if (!seenEdges.has(edgeId)) {
+          seenEdges.add(edgeId);
+          fileEdges.push({
+            id: edgeId,
+            source: sourceFile,
+            target: targetFile,
+          });
+        }
       }
     });
   });
 
+  // Build edges from function calls
   functionCalls.forEach((calls, sourceFile) => {
     calls.forEach((call) => {
       const targetFile = findFileForFunction(call, fileFunctions);
       if (targetFile && targetFile !== sourceFile) {
-        fileEdges.push({
-          id: `${sourceFile}-calls-${targetFile}::${call}`,
-          source: sourceFile,
-          target: targetFile,
-        });
+        const edgeId = `${sourceFile}-calls-${targetFile}::${call}`;
+        if (!seenEdges.has(edgeId)) {
+          seenEdges.add(edgeId);
+          fileEdges.push({
+            id: edgeId,
+            source: sourceFile,
+            target: targetFile,
+          });
+        }
       }
     });
   });
 
-  fileNodes.forEach((node, i) => {
-    fileNodes.slice(i + 1).forEach((otherNode) => {
-      const nodeDir = path.dirname(node.id);
-      const otherDir = path.dirname(otherNode.id);
-      
-      if (nodeDir === otherDir && nodeDir !== '.' && !hasEdge(fileEdges, node.id, otherNode.id)) {
-        fileEdges.push({
-          id: `${node.id}-samedir-${otherNode.id}`,
-          source: node.id,
-          target: otherNode.id,
-        });
+  // Add same-directory relationships (simplified - only for close files)
+  const dirMap = new Map<string, FileNode[]>();
+  fileNodes.forEach(node => {
+    const nodeDir = path.dirname(node.id);
+    if (nodeDir !== '.') {
+      if (!dirMap.has(nodeDir)) {
+        dirMap.set(nodeDir, []);
       }
-    });
+      dirMap.get(nodeDir)!.push(node);
+    }
+  });
+
+  // Only add edges for files in the same directory (max 5 files per dir to avoid clutter)
+  dirMap.forEach((nodes, dir) => {
+    if (nodes.length > 1 && nodes.length <= 5) {
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const edgeId = `${nodes[i].id}-samedir-${nodes[j].id}`;
+          if (!seenEdges.has(edgeId)) {
+            seenEdges.add(edgeId);
+            fileEdges.push({
+              id: edgeId,
+              source: nodes[i].id,
+              target: nodes[j].id,
+            });
+          }
+        }
+      }
+    }
   });
 
   return {
@@ -1314,11 +1342,65 @@ function resolveImport(
   importPath: string,
   allFiles: FileNode[]
 ): string | null {
-  const normalized = importPath.replace(/^[\.\/]+/, '').replace(/\.(js|ts|jsx|tsx)$/, '');
+  // Remove query strings and hash fragments
+  const cleanImport = importPath.split('?')[0].split('#')[0];
   
+  // Handle relative imports
+  if (cleanImport.startsWith('./') || cleanImport.startsWith('../')) {
+    const sourceDir = path.dirname(sourceFile);
+    const resolvedPath = path.resolve('/', sourceDir, cleanImport).replace(/^\//, '');
+    
+    // Try exact match first
+    for (const file of allFiles) {
+      if (file.id === resolvedPath) {
+        return file.id;
+      }
+    }
+    
+    // Try with common extensions
+    const extensions = ['', '.js', '.ts', '.jsx', '.tsx', '/index.js', '/index.ts', '/index.jsx', '/index.tsx'];
+    for (const ext of extensions) {
+      const candidate = resolvedPath + ext;
+      for (const file of allFiles) {
+        if (file.id === candidate || file.id.replace(/\.(js|ts|jsx|tsx)$/, '') === candidate.replace(/\.(js|ts|jsx|tsx)$/, '')) {
+          return file.id;
+        }
+      }
+    }
+  }
+  
+  // Handle absolute/npm imports - match by filename or path segment
+  const importParts = cleanImport.split('/');
+  const lastPart = importParts[importParts.length - 1];
+  const normalized = cleanImport.replace(/^[\.\/]+/, '').replace(/\.(js|ts|jsx|tsx)$/, '');
+  
+  // Try exact match
   for (const file of allFiles) {
     const fileNormalized = file.id.replace(/\.(js|ts|jsx|tsx)$/, '');
-    if (fileNormalized.endsWith(normalized)) {
+    if (fileNormalized === normalized || fileNormalized.endsWith('/' + normalized)) {
+      return file.id;
+    }
+  }
+  
+  // Try matching by last segment (filename)
+  const filename = path.basename(sourceFile);
+  const importBasename = path.basename(cleanImport, path.extname(cleanImport));
+  
+  for (const file of allFiles) {
+    const fileBasename = path.basename(file.id, path.extname(file.id));
+    if (fileBasename === importBasename && file.id !== sourceFile) {
+      // Prefer files in the same directory or nearby
+      const fileDir = path.dirname(file.id);
+      const sourceDir = path.dirname(sourceFile);
+      if (fileDir === sourceDir || fileDir.startsWith(sourceDir)) {
+        return file.id;
+      }
+    }
+  }
+  
+  // Last resort: partial match by last segment
+  for (const file of allFiles) {
+    if (file.id.includes(lastPart) && file.id !== sourceFile) {
       return file.id;
     }
   }
@@ -1327,10 +1409,29 @@ function resolveImport(
 }
 
 function findFileForFunction(functionName: string, fileFunctions: Map<string, Set<string>>): string | null {
+  // Try exact match first
   for (const [file, functions] of fileFunctions.entries()) {
     if (functions.has(functionName)) {
       return file;
     }
   }
+  
+  // Try matching method calls (e.g., "Class.method" or "obj.method")
+  const parts = functionName.split('.');
+  if (parts.length > 1) {
+    const className = parts[0];
+    const methodName = parts[parts.length - 1];
+    
+    // Look for class in files
+    for (const [file, functions] of fileFunctions.entries()) {
+      if (functions.has(className)) {
+        // Check if this file also has the method
+        if (functions.has(`${className}.${methodName}`) || functions.has(methodName)) {
+          return file;
+        }
+      }
+    }
+  }
+  
   return null;
 }

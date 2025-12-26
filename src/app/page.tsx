@@ -82,7 +82,7 @@ export default function Home() {
           setLoading(false);
           setProgress(null);
         }
-      }, 1000);
+      }, 500); // Poll every 500ms for more responsive updates
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');

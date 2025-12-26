@@ -108,7 +108,7 @@ export async function POST(request: NextRequest) {
 
     // OPTIMIZATION: Debounce progress updates to reduce database writes
     let lastProgressUpdate = Date.now();
-    const progressUpdateInterval = 500; // Update DB max once per 500ms for smoother progress
+    const progressUpdateInterval = 250; // Update DB max once per 250ms for more responsive progress
 
     // Update progress immediately to show analysis is starting
     try {
