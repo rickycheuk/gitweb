@@ -162,17 +162,19 @@ export async function GET(request: NextRequest) {
             // Add retry logic for deadlock errors
             if (cached && latestPreview !== cached.previewImageUrl) {
               // Retry logic for deadlock/conflict errors
-              const updateCache = async (retries = 3) => {
-                for (let i = 0; i < retries; i++) {
+              const updateCache = async (maxRetries = 3) => {
+                for (let i = 0; i < maxRetries; i++) {
                   try {
                     await prisma.repositoryCache.update({
                       where: { repoUrl: item.repoUrl },
                       data: { previewImageUrl: latestPreview },
                     });
                     return; // Success, exit
-                  } catch (err: any) {
+                  } catch (err: unknown) {
                     // If it's a deadlock/conflict error (P2034) and we have retries left
-                    if (err?.code === 'P2034' && i < retries - 1) {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const prismaError = err as any;
+                    if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
                       // Wait a random amount of time (exponential backoff) before retrying
                       await new Promise(resolve => setTimeout(resolve, Math.random() * 100 * (i + 1)));
                       continue;

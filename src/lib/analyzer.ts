@@ -198,8 +198,8 @@ export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCa
           const newPreviewUrl = await generateGraphPreview(analysisResult, repoUrl, true);
           if (newPreviewUrl) {
             // Retry logic for deadlock/conflict errors
-            let retries = 3;
-            for (let i = 0; i < retries; i++) {
+            const maxRetries = 3;
+            for (let i = 0; i < maxRetries; i++) {
               try {
                 await prisma.repositoryCache.update({
                   where: { repoUrl },
@@ -207,8 +207,10 @@ export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCa
                 });
                 console.log(`Regenerated preview image for ${repoUrl}`);
                 break; // Success
-              } catch (err: any) {
-                if (err?.code === 'P2034' && i < retries - 1) {
+              } catch (err: unknown) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const prismaError = err as any;
+                if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
                   await new Promise(resolve => setTimeout(resolve, Math.random() * 100 * (i + 1)));
                   continue;
                 }
@@ -471,8 +473,8 @@ async function cacheResult(
     }
 
     // Retry logic for Prisma deadlock/conflict errors (P2034)
-    const upsertWithRetry = async (retries = 3) => {
-      for (let i = 0; i < retries; i++) {
+    const upsertWithRetry = async (maxRetries = 3) => {
+      for (let i = 0; i < maxRetries; i++) {
         try {
           await prisma.repositoryCache.upsert({
             where: { repoUrl },
@@ -491,9 +493,11 @@ async function cacheResult(
             },
           });
           return; // Success
-        } catch (err: any) {
+        } catch (err: unknown) {
           // If it's a deadlock/conflict error (P2034) and we have retries left
-          if (err?.code === 'P2034' && i < retries - 1) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const prismaError = err as any;
+          if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
             // Wait a random amount of time (exponential backoff) before retrying
             await new Promise(resolve => setTimeout(resolve, Math.random() * 100 * (i + 1)));
             continue;

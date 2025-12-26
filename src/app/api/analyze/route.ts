@@ -140,17 +140,19 @@ export async function POST(request: NextRequest) {
           : JSON.stringify(progress);
         
         // Retry logic for deadlock/conflict errors
-        let retries = 3;
-        for (let i = 0; i < retries; i++) {
+        const maxRetries = 3;
+        for (let i = 0; i < maxRetries; i++) {
           try {
             await prisma.analysisProgress.update({
               where: { sessionId },
               data: { progress: progressString },
             });
             break; // Success, exit retry loop
-          } catch (err: any) {
+          } catch (err: unknown) {
             // If it's a deadlock/conflict error (P2034) and we have retries left
-            if (err?.code === 'P2034' && i < retries - 1) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const prismaError = err as any;
+            if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
               // Wait a random amount of time before retrying
               await new Promise(resolve => setTimeout(resolve, Math.random() * 50 * (i + 1)));
               continue;
