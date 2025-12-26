@@ -159,11 +159,35 @@ export async function GET(request: NextRequest) {
             
             // Update the cache with the latest preview URL for future requests
             // This is done in the background and doesn't block the response
+            // Add retry logic for deadlock errors
             if (cached && latestPreview !== cached.previewImageUrl) {
-              prisma.repositoryCache.update({
-                where: { repoUrl: item.repoUrl },
-                data: { previewImageUrl: latestPreview },
-              }).catch(err => console.warn(`Failed to update cache with latest preview for ${item.repoUrl}:`, err));
+              // Retry logic for deadlock/conflict errors
+              const updateCache = async (maxRetries = 3) => {
+                for (let i = 0; i < maxRetries; i++) {
+                  try {
+                    await prisma.repositoryCache.update({
+                      where: { repoUrl: item.repoUrl },
+                      data: { previewImageUrl: latestPreview },
+                    });
+                    return; // Success, exit
+                  } catch (err: unknown) {
+                    // If it's a deadlock/conflict error (P2034) and we have retries left
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const prismaError = err as any;
+                    if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
+                      // Wait a random amount of time (exponential backoff) before retrying
+                      await new Promise(resolve => setTimeout(resolve, Math.random() * 100 * (i + 1)));
+                      continue;
+                    }
+                    // Otherwise, log and give up
+                    console.warn(`Failed to update cache with latest preview for ${item.repoUrl}:`, err);
+                    return;
+                  }
+                }
+              };
+              updateCache().catch(() => {
+                // Silent failure for background operation
+              });
             }
           } else {
             // Fallback to cached URL if no images found in S3

@@ -197,11 +197,26 @@ export async function analyzeRepository(repoUrl: string, onProgress?: ProgressCa
         try {
           const newPreviewUrl = await generateGraphPreview(analysisResult, repoUrl, true);
           if (newPreviewUrl) {
-            await prisma.repositoryCache.update({
-              where: { repoUrl },
-              data: { previewImageUrl: newPreviewUrl }
-            });
-            console.log(`Regenerated preview image for ${repoUrl}`);
+            // Retry logic for deadlock/conflict errors
+            const maxRetries = 3;
+            for (let i = 0; i < maxRetries; i++) {
+              try {
+                await prisma.repositoryCache.update({
+                  where: { repoUrl },
+                  data: { previewImageUrl: newPreviewUrl }
+                });
+                console.log(`Regenerated preview image for ${repoUrl}`);
+                break; // Success
+              } catch (err: unknown) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const prismaError = err as any;
+                if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
+                  await new Promise(resolve => setTimeout(resolve, Math.random() * 100 * (i + 1)));
+                  continue;
+                }
+                throw err;
+              }
+            }
           }
         } catch (error) {
           console.warn(`Failed to regenerate preview for ${repoUrl}:`, error);
@@ -457,22 +472,43 @@ async function cacheResult(
       updateData.previewImageUrl = previewImageUrl;
     }
 
-    await prisma.repositoryCache.upsert({
-      where: { repoUrl },
-      update: updateData,
-      create: {
-        repoUrl,
-        repoName,
-        owner,
-        repo,
-        commitHash: combinedHash,
-        fileCount,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        analysisResult: analysisResult as any,
-        imageUrl: imageUrl || null,
-        previewImageUrl: previewImageUrl || null,
-      },
-    });
+    // Retry logic for Prisma deadlock/conflict errors (P2034)
+    const upsertWithRetry = async (maxRetries = 3) => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          await prisma.repositoryCache.upsert({
+            where: { repoUrl },
+            update: updateData,
+            create: {
+              repoUrl,
+              repoName,
+              owner,
+              repo,
+              commitHash: combinedHash,
+              fileCount,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              analysisResult: analysisResult as any,
+              imageUrl: imageUrl || null,
+              previewImageUrl: previewImageUrl || null,
+            },
+          });
+          return; // Success
+        } catch (err: unknown) {
+          // If it's a deadlock/conflict error (P2034) and we have retries left
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const prismaError = err as any;
+          if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
+            // Wait a random amount of time (exponential backoff) before retrying
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 100 * (i + 1)));
+            continue;
+          }
+          // Otherwise, throw the error
+          throw err;
+        }
+      }
+    };
+
+    await upsertWithRetry();
   } catch (error) {
     console.error(`Failed to cache result for ${repoUrl}:`, error);
   }

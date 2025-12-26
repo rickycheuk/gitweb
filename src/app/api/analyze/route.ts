@@ -123,7 +123,8 @@ export async function POST(request: NextRequest) {
     // Start analysis in background
     // On Vercel, serverless functions continue executing after response is sent
     // until they hit the timeout (10s for free tier, 60s for pro)
-    analyzeRepository(repoUrl, async (progress: string | ProgressData) => {
+    // We need to ensure the promise chain starts executing immediately
+    const analysisPromise = analyzeRepository(repoUrl, async (progress: string | ProgressData) => {
       const now = Date.now();
       // Only update database if 500ms+ have passed since last update
       if (now - lastProgressUpdate < progressUpdateInterval) {
@@ -138,10 +139,29 @@ export async function POST(request: NextRequest) {
           ? progress 
           : JSON.stringify(progress);
         
-        await prisma.analysisProgress.update({
-          where: { sessionId },
-          data: { progress: progressString },
-        });
+        // Retry logic for deadlock/conflict errors
+        const maxRetries = 3;
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            await prisma.analysisProgress.update({
+              where: { sessionId },
+              data: { progress: progressString },
+            });
+            break; // Success, exit retry loop
+          } catch (err: unknown) {
+            // If it's a deadlock/conflict error (P2034) and we have retries left
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const prismaError = err as any;
+            if (prismaError?.code === 'P2034' && i < maxRetries - 1) {
+              // Wait a random amount of time before retrying
+              await new Promise(resolve => setTimeout(resolve, Math.random() * 50 * (i + 1)));
+              continue;
+            }
+            // Otherwise, log and give up
+            console.warn('Failed to update progress:', err);
+            break;
+          }
+        }
       } catch (err) {
         console.warn('Failed to update progress:', err);
       }
@@ -168,10 +188,20 @@ export async function POST(request: NextRequest) {
             error: error instanceof Error ? error.message : String(error),
           },
         });
-      } catch (err) {
-        console.error('Failed to save error:', err);
-      }
+        } catch (err) {
+          console.error('Failed to save error:', err);
+        }
+      });
+
+    // Ensure the promise chain starts executing by attaching error handler
+    // This prevents unhandled promise rejections
+    analysisPromise.catch((err) => {
+      console.error('Unhandled error in analysis promise:', err);
     });
+
+    // Trigger the analysis to start (fire and forget)
+    // The promise will continue executing in the background on Vercel
+    void analysisPromise;
 
     return NextResponse.json({ sessionId });
   } catch (error) {
